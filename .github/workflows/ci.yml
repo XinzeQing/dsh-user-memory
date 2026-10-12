@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: node ${{ matrix.node-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ['20.x', '22.x', '24.x']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      # This plugin has no dependencies and no build step, so there is
+      # deliberately no `npm install` / `npm ci` here. Asserting that keeps
+      # the "zero dependency, nothing to build" claim honest.
+      - name: Assert zero dependencies and no build step
+        run: |
+          node --input-type=commonjs -e "
+            const fs = require('fs');
+            const p = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            const deps = Object.keys(p.dependencies || {}).length;
+            const dev = Object.keys(p.devDependencies || {}).length;
+            const scripts = p.scripts || {};
+            if (deps + dev > 0) {
+              console.error('unexpected dependencies: ' + deps + ' runtime, ' + dev + ' dev');
+              process.exit(1);
+            }
+            const buildish = ['prepare', 'build', 'prepublishOnly'].filter((k) => k in scripts);
+            if (buildish.length) {
+              console.error('unexpected build scripts: ' + buildish.join(', '));
+              process.exit(1);
+            }
+            console.log('zero dependencies, no build step: OK');
+          "
+
+      # Checklist item 1/2: the dsh.bundle manifest exists and its patch file
+      # is really on disk. Checklist item 4: every whitelisted file exists.
+      - name: Assert dsh.bundle manifest and files whitelist
+        run: |
+          node --input-type=commonjs -e "
+            const fs = require('fs');
+            const p = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            const patch = p.dsh && p.dsh.bundle && p.dsh.bundle.patch;
+            if (!patch) { console.error('package.json has no dsh.bundle.patch'); process.exit(1); }
+            if (!fs.existsSync(patch)) { console.error('dsh.bundle.patch points at a missing file: ' + patch); process.exit(1); }
+            console.log('dsh.bundle.patch -> ' + patch + ' (exists)');
+            const missing = (p.files || []).filter((f) => !f.includes('*') && !fs.existsSync(f));
+            if (missing.length) { console.error('files whitelist references missing paths: ' + missing.join(', ')); process.exit(1); }
+            console.log('files whitelist: ' + (p.files || []).length + ' entries, all present or globs');
+          "
+
+      - name: Syntax check
+        run: |
+          node --check index.js
+          node --check client.js
+
+      # Host side: real HTTP route + real injection into a temp memory dir.
+      - name: Self-test - injection and HTTP route
+        run: node test/selftest.mjs
+
+      # Host side: both model tools registered against the real registry
+      # validator, with finished JSON Schema (not a defineTool shorthand).
+      - name: Self-test - tool registration and schema
+        run: node test/suggest-test.mjs
