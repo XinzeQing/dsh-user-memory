@@ -1,0 +1,54 @@
+{
+  "name": "dsh-user-memory",
+  "version": "0.3.0",
+  "description": "User-authored tiered long-term memory for DeepSeek Harness: must/should rules, user profile, and agent behavior setting, injected as a system-prompt section, with a Chinese graphical panel for viewing and editing it. Writes only ever happen when the user asks or saves.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/qingzhijie05/dsh-user-memory.git"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "cordis-plugin",
+    "memory",
+    "long-term-memory",
+    "user-memory",
+    "system-prompt"
+  ],
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-api-remotes",
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-sidebar-right"
+      ]
+    }
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "test/selftest.mjs",
+    "test/suggest-test.mjs",
+    "README.md",
+    "LICENSE"
+  ]
+}
