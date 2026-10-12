@@ -1,0 +1,13 @@
+# Bundle patch: mounts the user-memory host plugin into a profile's layer stack.
+#
+# config:
+#   enabled  - false unmounts the injection without uninstalling the bundle
+#   dir      - memory directory; empty means <DSH_HOME>/memory
+#   maxChars - total character budget for the injected block
+- insert:
+    - id: user-memory
+      name: 'dsh-user-memory'
+      config:
+        enabled: true
+        dir: ''
+        maxChars: 6000
