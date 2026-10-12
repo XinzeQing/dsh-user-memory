@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "User Memory",
+    "description": "User-authored tiered long-term memory (must/should rules, user profile, agent behavior) injected into the system prompt. Read-only; written only on request."
+  }
+}
