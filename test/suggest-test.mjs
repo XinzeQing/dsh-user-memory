@@ -279,6 +279,145 @@ check(
   loaded.suggestFile,
 )
 
+// ---------- 13. the user's own supplement rides along with the acceptance ----------
+// The panel's 补充框 is not a chat box: it writes nothing until 采纳 is clicked,
+// and then it must reach the model together with the proposal.
+const sPost = async (payload) => (await second.box.route.fetch(request(payload))).json()
+const sSuggest = second.box.tools.find((t) => t.name === 'memory_suggest')
+const sItems = async () => (await sPost({ action: 'suggestions' })).items
+const sStored = async () =>
+  JSON.parse(await readFile(join(home, 'memory-suggest.json'), 'utf8')).items
+
+// Regression: leaving `why` out used to store `undefined` on the item, and
+// `JSON.stringify(store)` answered `undefined` — `writeFile(undefined)` threw,
+// `saveStore` swallowed it into a warn log, and the tool still said "已放进待
+// 确认区" while nothing reached the disk. The write must survive it silently.
+const noWhy = await sSuggest.execute({ file: 'log.md', text: '这条没有 why。' })
+check(
+  'store: a proposal without `why` is still written to disk',
+  (await sStored()).some((item) => item.id === noWhy.id && item.why === ''),
+  JSON.stringify(noWhy),
+)
+check(
+  'store: and it shows up in the waiting area',
+  (await sItems()).some((item) => item.id === noWhy.id),
+  `id=${noWhy.id} pending=${(await sPost({ action: 'suggestions' })).pending}`,
+)
+const noWhyFile = JSON.parse(await readFile(join(home, 'memory-suggest.json'), 'utf8'))
+check(
+  'store: no item keeps an `undefined` field',
+  Array.isArray(noWhyFile.items) && noWhyFile.items.every((item) => item.why !== undefined),
+  `items=${noWhyFile.items.length}`,
+)
+check(
+  'store: the whole store still round-trips after that proposal',
+  (await sPost({ action: 'resolveSuggestion', id: noWhy.id, decision: 'dismiss' })).ok === true,
+  `dismissed #${noWhy.id}`,
+)
+
+const withNote = await sPost({
+  action: 'resolveSuggestion',
+  id: '3',
+  decision: 'accept',
+  note: '  写成两句话，别用术语。  ',
+})
+check(
+  'note: accept records the supplement (trimmed)',
+  withNote.ok === true && withNote.status === 'accepted' && withNote.userNote === '写成两句话，别用术语。',
+  JSON.stringify(withNote.userNote),
+)
+const noteStored = (await sStored()).find((i) => i.id === '3')
+check(
+  'note: the supplement is persisted, not merely echoed',
+  noteStored.userNote === '写成两句话，别用术语。' && typeof noteStored.userNoteAt === 'string',
+)
+check('note: an accepted item leaves the pending count', (await sPost({ action: 'suggestions' })).pending === 0)
+
+// ---------- 14. an acceptance can be taken back before the next turn ----------
+const revoked = await sPost({ action: 'resolveSuggestion', id: '3', decision: 'revoke' })
+check(
+  'revoke: an accepted item goes back to waiting',
+  revoked.ok === true && revoked.status === 'pending' && revoked.pending === 1,
+  JSON.stringify(revoked),
+)
+const afterRevoke = (await sItems()).find((i) => i.id === '3')
+check(
+  'revoke: the supplement survives so it can still be edited',
+  afterRevoke.status === 'pending' &&
+    afterRevoke.userNote === '写成两句话，别用术语。' &&
+    afterRevoke.decidedAt === undefined &&
+    afterRevoke.deliveredAt === undefined,
+)
+
+const reAccepted = await sPost({ action: 'resolveSuggestion', id: '3', decision: 'accept', note: '改成一句话。' })
+const nDecision = { kind: 'enter', messages: [] }
+const nDelivered = await second.box.preStep({ messages: [{ source: { kind: 'user' } }] }, async () => nDecision)
+const nText = nDelivered.messages[0].content[0].text
+check(
+  'note: the notice carries the supplement to the model',
+  nDelivered.messages.length === 1 &&
+    nText.includes('用户补充') &&
+    nText.includes('改成一句话。') &&
+    nText.includes('以它为准'),
+  nText.includes('改成一句话。') ? 'carried' : 'missing',
+)
+check(
+  'note: the edited supplement replaced the first one',
+  reAccepted.userNote === '改成一句话。' && !nText.includes('写成两句话'),
+)
+
+// ---------- 15. the window really is closed once the notice is out ----------
+const late = await second.box.route.fetch(
+  request({ action: 'resolveSuggestion', id: '3', decision: 'revoke' }),
+)
+const lateBody = await late.json()
+check(
+  'revoke: refused (409) once the notice is delivered',
+  lateBody.ok === false && late.status === 409 && lateBody.status === 'delivered',
+  lateBody.error,
+)
+check(
+  'revoke: the delivered item stays delivered',
+  (await sItems()).find((i) => i.id === '3').status === 'delivered',
+)
+const pendingItem = await sSuggest.execute({ file: 'profile.md', text: '一条还没决定的建议' })
+const early = await second.box.route.fetch(
+  request({ action: 'resolveSuggestion', id: pendingItem.id, decision: 'revoke' }),
+)
+check(
+  'revoke: refused (409) for an item that never left the waiting area',
+  (await early.json()).ok === false && early.status === 409,
+)
+const unknownRevoke = await second.box.route.fetch(
+  request({ action: 'resolveSuggestion', id: '999', decision: 'revoke' }),
+)
+check(
+  'revoke: 404 for an unknown id',
+  (await unknownRevoke.json()).ok === false && unknownRevoke.status === 404,
+)
+
+// ---------- 16. an empty box means "no supplement at all" ----------
+const plainItem = await sSuggest.execute({ file: 'rules-should.md', text: '另一条建议' })
+const plain = await sPost({ action: 'resolveSuggestion', id: plainItem.id, decision: 'accept', note: '   ' })
+check(
+  'note: a blank supplement stores nothing extra',
+  plain.userNote === '' && (await sStored()).find((i) => i.id === plainItem.id).userNote === '',
+)
+const longItem = await sSuggest.execute({ file: 'log.md', text: '第三条建议' })
+const capped = await sPost({
+  action: 'resolveSuggestion',
+  id: longItem.id,
+  decision: 'accept',
+  note: 'n'.repeat(1500),
+})
+check('note: caps the supplement at 1000 chars', capped.userNote.length === 1000, `len=${capped.userNote.length}`)
+const dismissNoNote = await sSuggest.execute({ file: 'agent.md', text: '第四条建议' })
+const dismissedPlain = await sPost({ action: 'resolveSuggestion', id: dismissNoNote.id, decision: 'dismiss' })
+check(
+  'note: dismissing never records a supplement',
+  dismissedPlain.status === 'dismissed' && dismissedPlain.userNote === '',
+)
+
 for (const entry of [first, second]) {
   for (const fn of entry.box.disposers) if (typeof fn === 'function') fn()
 }

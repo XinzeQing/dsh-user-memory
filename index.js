@@ -53,6 +53,8 @@ const SOURCE_KIND = 'plugin:dsh-user-memory'
 const SUGGEST_FILE = 'memory-suggest.json'
 /** Hard ceiling for one suggestion's wording. */
 const MAX_SUGGEST_CHARS = 4000
+/** Hard ceiling for the user's own supplement ("补充说明") attached to one suggestion. */
+const MAX_NOTE_CHARS = 1000
 /** Decided suggestions are pruned once the store grows past this. */
 const MAX_KEPT_ITEMS = 80
 
@@ -250,10 +252,18 @@ function acceptedText(items) {
     lines.push('', `#${item.id} → ${item.file}`)
     for (const line of String(item.text).split(/\r?\n/)) lines.push(`  ${line}`)
     if (typeof item.why === 'string' && item.why !== '') lines.push(`  理由：${item.why}`)
+    // The user's own supplement, written into the panel's 补充框 and stored the
+    // moment they clicked 采纳. It outranks my wording; say so explicitly, so a
+    // later reader never mistakes it for a side note.
+    if (typeof item.userNote === 'string' && item.userNote !== '') {
+      lines.push('  用户补充（用户自己在采纳时写的额外说明；与上面的原文冲突时以它为准）：')
+      for (const line of item.userNote.split(/\r?\n/)) lines.push(`    ${line}`)
+    }
   }
   lines.push(
     '',
     '现在把每一条总结成合适的措辞，并进对应记忆文件（直接用文件工具改）。',
+    '带「用户补充」的条目，把补充当作该条的最终要求：与建议原文冲突时以补充为准；补充里已经给出的具体措辞直接照用。',
     '两种例外要先停下、把 diff 摆给用户看：你的措辞与用户采纳的原文有实质差异；或这条与文件里已有内容重复、冲突。',
     '每一条处理完（写完，或说明为什么不写）调用一次 memory_suggest_done。',
     '</MEMORY_SUGGESTION_ACCEPTED>',
@@ -310,10 +320,19 @@ export async function apply(ctx, config = {}) {
     }
   }
 
+  /** Drop `undefined` values so `JSON.stringify` can never return `undefined`. */
+  const jsonSafe = (value) => JSON.parse(JSON.stringify(value ?? null, (_key, item) => (item === undefined ? undefined : item)))
+
   const saveStore = async () => {
     try {
       await mkdir(home, { recursive: true })
-      await writeFile(suggestPath, JSON.stringify(store, null, 2), 'utf8')
+      // `JSON.stringify` answers `undefined` for a value whose own properties —
+      // or an item inside `items` — hold `undefined` (an optional tool argument
+      // that was left out, for instance), and `writeFile(undefined)` throws.
+      // That used to make the whole proposal disappear with only a warn log:
+      // the tool still returned "已放进待确认区", but nothing was ever written.
+      // Serializing a value that is guaranteed JSON-clean keeps the write honest.
+      await writeFile(suggestPath, JSON.stringify(jsonSafe(store), null, 2), 'utf8')
     } catch (error) {
       ctx.logger?.warn?.(`user-memory: 待确认区写入失败 ${suggestPath}: ${String(error)}`)
     }
@@ -544,18 +563,55 @@ export async function apply(ctx, config = {}) {
     if (action === 'resolveSuggestion') {
       const id = typeof payload?.id === 'string' ? payload.id : String(payload?.id ?? '')
       const choice = payload?.decision
-      if (choice !== 'accept' && choice !== 'dismiss') {
-        return Response.json({ ok: false, error: '决定必须是 accept 或 dismiss' }, { status: 400 })
+      if (choice !== 'accept' && choice !== 'dismiss' && choice !== 'revoke') {
+        return Response.json({ ok: false, error: '决定必须是 accept、dismiss 或 revoke' }, { status: 400 })
       }
       const item = store.items.find((entry) => entry.id === id)
       if (item === undefined) {
         return Response.json({ ok: false, error: '找不到这条建议' }, { status: 404 })
       }
+
+      // 撤销：只对「已采纳、但还没交到下一轮」那一小段窗口有效 —— 这正是误点
+      // 与反悔的窗口。判定只依据当前 status，所以重复点击、以及和 pre-step
+      // 送达撞车（先送达、后撤销）都不会把状态写坏：撞车时这里如实拒绝。
+      if (choice === 'revoke') {
+        if (item.status === 'pending') {
+          return Response.json({ ok: false, error: '这条还在等你决定，不需要撤销。' }, { status: 409 })
+        }
+        if (item.status !== 'accepted') {
+          const reason =
+            item.status === 'delivered'
+              ? '这条已经交到下一轮了（我已经收到），无法撤销；可以在对话里直接让我别写。'
+              : '这条已经处理完了，无法撤销。'
+          return Response.json({ ok: false, error: reason, status: item.status }, { status: 409 })
+        }
+        item.status = 'pending'
+        delete item.decidedAt
+        delete item.deliveredAt
+        await saveStore()
+        ctx.logger?.info?.(`user-memory: 建议 #${id} 撤销采纳 → pending`)
+        return Response.json({ ok: true, id, status: item.status, pending: pendingCount() })
+      }
+
+      // The user's own supplement travels with the acceptance. It is stored here
+      // and only here — typing into the panel's box writes nothing, so an
+      // undecided suggestion leaves no trace on disk.
+      if (choice === 'accept' && typeof payload?.note === 'string') {
+        item.userNote = payload.note.trim().slice(0, MAX_NOTE_CHARS)
+        item.userNoteAt = new Date().toISOString()
+      }
+
       item.status = choice === 'accept' ? 'accepted' : 'dismissed'
       item.decidedAt = new Date().toISOString()
       await saveStore()
       ctx.logger?.info?.(`user-memory: 建议 #${id} → ${item.status}`)
-      return Response.json({ ok: true, id, status: item.status })
+      return Response.json({
+        ok: true,
+        id,
+        status: item.status,
+        pending: pendingCount(),
+        userNote: typeof item.userNote === 'string' ? item.userNote : '',
+      })
     }
 
     if (action === 'save') {

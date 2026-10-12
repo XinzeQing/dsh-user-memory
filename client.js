@@ -25,7 +25,7 @@ window.__ModuleLoader__.load({
     // Tabs = the editable files, plus the waiting area where I propose and only
     // the user's click decides.
     const TABS = FILES.concat([
-      { file: PENDING_KEY, title: '待确认', hint: '我提议，你点「采纳」才会写进记忆' },
+      { file: PENDING_KEY, title: '待确认', hint: '我提议，你点「采纳」才会写进记忆；采纳后到我下一轮开跑之前可以撤销' },
     ]);
 
     const CSS = [
@@ -61,7 +61,13 @@ window.__ModuleLoader__.load({
       '.umem-stage{margin-left:auto;color:var(--dsw-alias-label-tertiary);}',
       '.umem-text{margin:0;white-space:pre-wrap;word-break:break-word;font-family:inherit;font-size:13px;line-height:1.7;color:var(--dsw-alias-label-primary);}',
       '.umem-why{margin-top:8px;font-size:12px;color:var(--dsw-alias-label-tertiary);}',
-      '.umem-cardfoot{display:flex;gap:10px;margin-top:12px;}',
+      '.umem-cardfoot{display:flex;gap:10px;margin-top:12px;align-items:flex-start;}',
+      '.umem-cardfoot .umem-msg{flex:1;line-height:1.6;}',
+      '.umem-note{margin-top:10px;width:100%;box-sizing:border-box;min-height:46px;resize:vertical;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);padding:8px 10px;font-family:inherit;font-size:12px;line-height:1.65;}',
+      '.umem-note:focus{outline:none;border-color:var(--dsw-alias-brand-primary);}',
+      '.umem-note:disabled{opacity:.6;}',
+      '.umem-note::placeholder{color:var(--dsw-alias-label-tertiary);}',
+      '.umem-note-ro{margin-top:10px;font-size:12px;line-height:1.7;color:var(--dsw-alias-label-secondary);white-space:pre-wrap;word-break:break-word;border-left:2px solid var(--dsw-alias-border-l1);padding-left:8px;}',
     ].join('\n');
 
     async function call(action, extra) {
@@ -109,6 +115,7 @@ window.__ModuleLoader__.load({
       const [message, setMessage] = useState(null);
       const [saving, setSaving] = useState(false);
       const [suggestions, setSuggestions] = useState([]);
+      const [notes, setNotes] = useState({});
       const [busyId, setBusyId] = useState('');
 
       const load = useCallback(async () => {
@@ -137,7 +144,22 @@ window.__ModuleLoader__.load({
       const loadSuggestions = useCallback(async () => {
         try {
           const data = await call('suggestions');
-          if (data && data.ok === true) setSuggestions(data.items || []);
+          if (data && data.ok === true) {
+            const items = data.items || [];
+            setSuggestions(items);
+            // Seed each 补充框 from what the server recorded (written when the
+            // user clicked 采纳). A box the user is already typing in keeps its
+            // draft — the 5s poll must never wipe half-written text.
+            setNotes(function (prev) {
+              const next = Object.assign({}, prev);
+              for (const item of items) {
+                if (typeof next[item.id] !== 'string') {
+                  next[item.id] = typeof item.userNote === 'string' ? item.userNote : '';
+                }
+              }
+              return next;
+            });
+          }
         } catch (error) {
           /* keep whatever we already had */
         }
@@ -188,20 +210,27 @@ window.__ModuleLoader__.load({
 
       // The one action the model can never take: deciding.
       const resolve = useCallback(
-        async (id, decision) => {
+        async (id, decision, extra) => {
           setBusyId(id);
           setMessage(null);
           try {
-            const data = await call('resolveSuggestion', { id: id, decision: decision });
+            const data = await call(
+              'resolveSuggestion',
+              Object.assign({ id: id, decision: decision }, extra || {}),
+            );
             if (!data || data.ok !== true) throw new Error((data && data.error) || '操作失败');
+            const wrote = Boolean(extra) && typeof extra.note === 'string' && extra.note.trim() !== '';
             setMessage({
               kind: 'ok',
               text:
                 decision === 'accept'
-                  ? '已采纳 #' + id + '。我下一轮会收到通知，然后把它总结进记忆。'
-                  : '已忽略 #' + id + '，它不会被写入。',
+                  ? '已采纳 #' + id + '。我下一轮会收到通知，然后把它总结进记忆。' +
+                    (wrote ? '你写的补充会一起交给我（和原文冲突时以补充为准）。' : '') +
+                    '在我下一轮开跑之前，这里随时可以撤销。'
+                  : decision === 'revoke'
+                    ? '已撤销 #' + id + '。它回到「等你决定」：可以改补充，也可以重新采纳。'
+                    : '已忽略 #' + id + '，它不会被写入。',
             });
-            await loadSuggestions();
           } catch (error) {
             setMessage({
               kind: 'err',
@@ -209,6 +238,9 @@ window.__ModuleLoader__.load({
             });
           } finally {
             setBusyId('');
+            // 成功失败都刷新：撤销正好撞上「我下一轮已开始」时，面板必须立刻
+            // 显示真实状态，而不是让用户以为撤销成功了。
+            await loadSuggestions();
           }
         },
         [loadSuggestions],
@@ -249,7 +281,7 @@ window.__ModuleLoader__.load({
 
       const STAGE = {
         pending: '等你决定',
-        accepted: '已采纳 · 等我下一轮写入',
+        accepted: '已采纳 · 可撤销，等我下一轮写入',
         delivered: '通知已送达 · 处理中',
         done: '已完成',
         dismissed: '已忽略',
@@ -282,6 +314,9 @@ window.__ModuleLoader__.load({
           { className: 'umem-list' },
           visible.map(function (item) {
             const isOpen = item.status === 'pending';
+            const isAccepted = item.status === 'accepted';
+            const isDelivered = item.status === 'delivered';
+            const recorded = typeof item.userNote === 'string' ? item.userNote.trim() : '';
             return h(
               'div',
               { key: item.id, className: 'umem-card', 'data-open': isOpen ? '1' : '0' },
@@ -295,6 +330,28 @@ window.__ModuleLoader__.load({
               h('pre', { className: 'umem-text' }, item.text),
               item.why ? h('div', { className: 'umem-why' }, '理由：' + item.why) : null,
               item.note ? h('div', { className: 'umem-why' }, '结果：' + item.note) : null,
+              // 补充框只给「等你决定」的卡片：落盘只发生在点「采纳」那一刻。
+              isOpen
+                ? h('textarea', {
+                    className: 'umem-note',
+                    rows: 2,
+                    spellCheck: false,
+                    disabled: busyId !== '',
+                    placeholder:
+                      '补充说明（可选）：你想额外加的要求。点「采纳」时它和我提议的原文一起交给我，冲突时以你的补充为准。',
+                    value: notes[item.id] || '',
+                    onChange: function (event) {
+                      const value = event.target.value;
+                      setNotes(function (prev) {
+                        const next = Object.assign({}, prev);
+                        next[item.id] = value;
+                        return next;
+                      });
+                    },
+                  })
+                : recorded !== ''
+                  ? h('div', { className: 'umem-note-ro' }, '你的补充：' + recorded)
+                  : null,
               isOpen
                 ? h(
                     'div',
@@ -305,7 +362,7 @@ window.__ModuleLoader__.load({
                         className: 'umem-btn',
                         disabled: busyId !== '',
                         onClick: function () {
-                          void resolve(item.id, 'accept');
+                          void resolve(item.id, 'accept', { note: notes[item.id] || '' });
                         },
                       },
                       busyId === item.id ? '处理中…' : '采纳',
@@ -322,7 +379,38 @@ window.__ModuleLoader__.load({
                       '忽略',
                     ),
                   )
-                : null,
+                : isAccepted
+                  ? h(
+                      'div',
+                      { className: 'umem-cardfoot' },
+                      h(
+                        'button',
+                        {
+                          className: 'umem-btn',
+                          disabled: busyId !== '',
+                          onClick: function () {
+                            void resolve(item.id, 'revoke');
+                          },
+                        },
+                        busyId === item.id ? '撤销中…' : '撤销采纳',
+                      ),
+                      h(
+                        'span',
+                        { className: 'umem-msg' },
+                        '已采纳，还没交到我下一轮。撤销后它回到「等你决定」，可以改完补充再采纳。',
+                      ),
+                    )
+                  : isDelivered
+                    ? h(
+                        'div',
+                        { className: 'umem-cardfoot' },
+                        h(
+                          'span',
+                          { className: 'umem-msg' },
+                          '这条已经交到我下一轮了，撤销来不及；要改就在对话里直接跟我说。',
+                        ),
+                      )
+                    : null,
             );
           }),
         );
@@ -435,7 +523,7 @@ window.__ModuleLoader__.load({
             message
               ? message.text
               : isPending
-                ? '「采纳」只是通知我下一轮来写。写入前若与这里的原文有实质差异，我会先把 diff 给你看。'
+                ? '「采纳」只是通知我下一轮来写；左下角补充框里的字，也是点「采纳」那一刻才存下来。采纳后到我下一轮开跑之前，可以「撤销采纳」。'
                 : '保存后立即生效，无需重启。注释 <!-- --> 不会注入给我。',
           ),
         ),

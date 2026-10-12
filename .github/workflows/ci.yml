@@ -76,3 +76,10 @@ jobs:
       # validator, with finished JSON Schema (not a defineTool shorthand).
       - name: Self-test - tool registration and schema
         run: node test/suggest-test.mjs
+
+      # Browser side: renders the real panel (jsdom + React). Those two are
+      # intentionally not dependencies of this plugin, so the test skips here
+      # and runs locally with UMEM_UI_DEPS pointing at a node_modules that has
+      # them. See the header of test/panel-test.mjs.
+      - name: Self-test - panel UI (skips without UMEM_UI_DEPS)
+        run: node test/panel-test.mjs
