@@ -187,6 +187,24 @@ function render(parts, maxChars) {
   return body.length === 0 ? '' : PREAMBLE + body
 }
 
+/**
+ * Appended to the injected block only while `autoCapture` is on.
+ *
+ * Two hard constraints ride on this constant:
+ *  1. it is CONSTANT — nothing from the conversation may be interpolated, or the
+ *     prompt would change every turn and prompt caching would be lost;
+ *  2. it sits OUTSIDE `maxChars`, so the user's own text keeps its full budget.
+ * A disabled switch appends `''`, leaving the prompt byte-identical.
+ */
+const AUTO_CAPTURE_NOTICE = [
+  '',
+  '## 记忆采集提醒（开关已打开）',
+  '',
+  '- 本次对话中若发现值得长期记住的用户偏好或规则（明说的要求、反复出现的偏好、明确的禁止项），调用 `memory_suggest` 把它放进待确认区。',
+  '- 不要直接改记忆文件：用户点了「采纳」才会真正写入。',
+  '- 只提你确实观察到的，不要为了凑数而提。',
+].join('\n')
+
 /** Create the memory directory and any missing template; never overwrite. */
 async function scaffold(dir) {
   await mkdir(dir, { recursive: true })
@@ -274,7 +292,7 @@ function acceptedText(items) {
 /**
  * Host plugin entry point.
  * @param {import('@deepseek-ai/cordis').Context} ctx
- * @param {{ enabled?: boolean, dir?: string, maxChars?: number }} [config]
+ * @param {{ enabled?: boolean, dir?: string, maxChars?: number, autoCapture?: boolean }} [config]
  */
 export async function apply(ctx, config = {}) {
   if (config.enabled === false) return
@@ -286,6 +304,9 @@ export async function apply(ctx, config = {}) {
     typeof config.maxChars === 'number' && Number.isFinite(config.maxChars) && config.maxChars > 0
       ? config.maxChars
       : DEFAULT_MAX_CHARS
+  // Opt-in: off unless the config literally says `true`, so an untouched profile
+  // injects exactly the bytes it injected before this field existed.
+  const autoCapture = config.autoCapture === true
 
   try {
     await scaffold(dir)
@@ -515,7 +536,7 @@ export async function apply(ctx, config = {}) {
         const body = stripComments(raw)
         if (meaningful(body)) parts.push({ title: spec.title, body })
       }
-      text = render(parts, maxChars)
+      text = render(parts, maxChars) + (autoCapture ? AUTO_CAPTURE_NOTICE : '')
     } catch (error) {
       ctx.logger?.warn?.(`user-memory: read failed, keeping previous text: ${String(error)}`)
     }

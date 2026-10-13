@@ -4,6 +4,8 @@
 #   enabled  - false unmounts the injection without uninstalling the bundle
 #   dir      - memory directory; empty means <DSH_HOME>/memory
 #   maxChars - total character budget for the injected block
+#   autoCapture - false (default) injects nothing extra; true appends a fixed
+#                 reminder telling the model to propose memory_suggest entries
 - insert:
     - id: user-memory
       name: 'dsh-user-memory'
@@ -11,3 +13,4 @@
         enabled: true
         dir: ''
         maxChars: 6000
+        autoCapture: false

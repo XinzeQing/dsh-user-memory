@@ -91,7 +91,53 @@ for (const f of ['rules-must.md', 'agent.md', 'profile.md', 'rules-should.md']) 
 await settle()
 check('empty: nothing injected at all', c.box.captured.text() === '', JSON.stringify(c.box.captured.text().slice(0, 60)))
 
-// ---------- 5. enabled:false mounts nothing ----------
+// ---------- 5. autoCapture (default off) ----------
+// The switch's whole promise: OFF is byte-identical to "this field never
+// existed", ON appends one constant block that does NOT eat the own-text budget.
+const captureBody = '# 必须遵守\n\n- 采集开关测试用的固定规则。\n'
+
+const dir5 = await mkdtemp(join(tmpdir(), 'um-'))
+const e = makeCtx()
+await apply(e.ctx, { dir: dir5 }) // autoCapture omitted entirely
+await writeFile(join(dir5, 'rules-must.md'), captureBody, 'utf8')
+await settle()
+const omitted = e.box.captured.text()
+
+const dir6 = await mkdtemp(join(tmpdir(), 'um-'))
+const f = makeCtx()
+await apply(f.ctx, { dir: dir6, autoCapture: false })
+await writeFile(join(dir6, 'rules-must.md'), captureBody, 'utf8')
+await settle()
+const off = f.box.captured.text()
+
+const dir7 = await mkdtemp(join(tmpdir(), 'um-'))
+const g = makeCtx()
+await apply(g.ctx, { dir: dir7, autoCapture: true })
+await writeFile(join(dir7, 'rules-must.md'), captureBody, 'utf8')
+await settle()
+const on = g.box.captured.text()
+
+check('autoCapture absent: notice NOT injected', !omitted.includes('记忆采集提醒'))
+check('autoCapture false: notice NOT injected', !off.includes('记忆采集提醒'))
+check('autoCapture false: byte-identical to absent', off === omitted && omitted.length > 0, `len ${off.length} vs ${omitted.length}`)
+check('autoCapture true: notice injected', on.includes('## 记忆采集提醒（开关已打开）'))
+check('autoCapture true: notice lands after the memory body', on.startsWith(off))
+check('autoCapture true: only the notice was added', on.slice(off.length).startsWith('\n## 记忆采集提醒（开关已打开）'))
+check('autoCapture true: body budget untouched (no truncation)', on.includes('采集开关测试用的固定规则') && !on.includes('已截断'))
+
+// The notice is out-of-budget on purpose: maxChars bounds the user's own text,
+// so turning the switch on may push the TOTAL past maxChars.
+const dir8 = await mkdtemp(join(tmpdir(), 'um-'))
+const h = makeCtx()
+await apply(h.ctx, { dir: dir8, maxChars: 300, autoCapture: true })
+await writeFile(join(dir8, 'rules-must.md'), '# 必须遵守\n\n' + '- 这是一条很长的规则。\n'.repeat(60), 'utf8')
+await settle()
+const cappedOn = h.box.captured.text()
+check('autoCapture true: own text still truncated at maxChars', cappedOn.includes('已截断'))
+check('autoCapture true: notice survives the truncation path', cappedOn.includes('记忆采集提醒'))
+check('autoCapture true: notice sits outside the budget', cappedOn.length > 300, `len=${cappedOn.length}`)
+
+// ---------- 6. enabled:false mounts nothing ----------
 const dir4 = await mkdtemp(join(tmpdir(), 'um-'))
 const d = makeCtx()
 await apply(d.ctx, { dir: dir4, enabled: false })
@@ -128,7 +174,7 @@ check('route: refuses an unknown action', unknown.ok === false)
 const garbage = await (await route.fetch({ json: async () => { throw new Error('bad body') } })).json()
 check('route: survives a malformed body', garbage.ok === false)
 
-for (const x of [a, b, c, d]) for (const fn of x.box.disposers) if (typeof fn === 'function') fn()
+for (const x of [a, b, c, d, e, f, g, h]) for (const fn of x.box.disposers) if (typeof fn === 'function') fn()
 
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURE(S)`)
 process.exit(failures === 0 ? 0 : 1)
