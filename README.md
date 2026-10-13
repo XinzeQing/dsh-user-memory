@@ -87,6 +87,10 @@ C:\Users\Adler\.dsh\memory\
 
 改完需要**重启**才对 composition 生效；只改记忆文件内容则不需要。
 
+> **实测注意：profile 里的 `config:` 是「整块替换」，不是逐键合并。**
+> 在 `C:\Users\Adler\.dsh\profiles\<profile>\cordis.patch.yml` 里写 `- id: user-memory` + `config:` 时，你列出的键会**顶掉** bundle 里的整套 config。比如只写 `autoCapture: true`，`dsh <profile> --dump-config` 读回来就是 `config: { autoCapture: true }` —— `dir` 和 `maxChars` 都不见了（退回内置默认值）。
+> 所以覆盖时**把你关心的键一次写全**：`enabled` / `dir` / `maxChars` / `autoCapture`。
+
 ### `autoCapture`：要不要让我主动提建议（默认关）
 
 **默认 `false`。关着的时候，注入的提示词与没有这个开关时逐字节相同——一个字符都不多。**
