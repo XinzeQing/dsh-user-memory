@@ -6,6 +6,13 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply } from '../index.js'
 
+// The switch state file lives in $DSH_HOME, so every case must run against a
+// throwaway home: otherwise this suite reads the real user's .autocapture and
+// its result depends on whether that person happens to have the switch on.
+const realHome = process.env.DSH_HOME
+const baseHome = await mkdtemp(join(tmpdir(), 'umhome-'))
+process.env.DSH_HOME = baseHome
+
 let failures = 0
 function check(label, ok, extra = '') {
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${label}${extra ? '  ' + extra : ''}`)
@@ -174,7 +181,85 @@ check('route: refuses an unknown action', unknown.ok === false)
 const garbage = await (await route.fetch({ json: async () => { throw new Error('bad body') } })).json()
 check('route: survives a malformed body', garbage.ok === false)
 
-for (const x of [a, b, c, d, e, f, g, h]) for (const fn of x.box.disposers) if (typeof fn === 'function') fn()
+// ---------- 7. the panel switch (runtime state file) ----------
+// The switch exists because `config` is a load-time snapshot the panel cannot
+// reach: flipping it must take effect on the NEXT model step, with no restart.
+// These blocks isolate DSH_HOME per case, because the state file lives beside
+// the suggestion store (in $DSH_HOME) rather than in the memory dir.
+// (`realHome` was captured at the top, before case 1 ran.)
+
+const iHome = await mkdtemp(join(tmpdir(), 'umhome-'))
+const iDir = await mkdtemp(join(tmpdir(), 'um-'))
+process.env.DSH_HOME = iHome
+const i = makeCtx()
+await apply(i.ctx, { dir: iDir, autoCapture: true })
+await writeFile(join(iDir, 'rules-must.md'), captureBody, 'utf8')
+await settle()
+check('switch: no state file -> the config decides', i.box.captured.text().includes('记忆采集提醒'))
+check('switch: no state file is created behind the user', !(await readdir(iHome)).includes('.autocapture'), (await readdir(iHome)).join(','))
+
+const iRoute = i.box.route
+const initial = await (await iRoute.fetch(request({ action: 'load' }))).json()
+check(
+  'switch: load reports state + where it came from',
+  initial.autoCapture.on === true && initial.autoCapture.source === 'config',
+  JSON.stringify(initial.autoCapture),
+)
+
+const flippedOff = await (await iRoute.fetch(request({ action: 'autoCapture', on: false }))).json()
+check('switch: the panel can turn it off', flippedOff.ok === true && flippedOff.autoCapture.on === false, JSON.stringify(flippedOff))
+check(
+  'switch: it writes the state file',
+  (await readFile(join(iHome, '.autocapture'), 'utf8')).trim() === 'off',
+  JSON.stringify(await readFile(join(iHome, '.autocapture'), 'utf8')),
+)
+// The whole point: no restart, no waiting out the 3s poll — the very next model
+// step sees the notice gone.
+check('switch: the notice is gone right away, without a poll', !i.box.captured.text().includes('记忆采集提醒'))
+check('switch: the memory body itself is untouched', i.box.captured.text().includes('采集开关测试用的固定规则'))
+
+const reloaded = await (await iRoute.fetch(request({ action: 'load' }))).json()
+check('switch: load now reports the panel as the source', reloaded.autoCapture.on === false && reloaded.autoCapture.source === 'panel', JSON.stringify(reloaded.autoCapture))
+
+const flippedOn = await (await iRoute.fetch(request({ action: 'autoCapture', on: true }))).json()
+check('switch: the panel can turn it back on', flippedOn.ok === true && flippedOn.autoCapture.on === true)
+check('switch: the notice is back right away', i.box.captured.text().includes('## 记忆采集提醒（开关已打开）'))
+
+// A state file the user hand-edited into gibberish must not silently disable
+// the feature: unrecognised content means "no opinion", so the config decides.
+await writeFile(join(iHome, '.autocapture'), 'maybe\n', 'utf8')
+await settle()
+check('switch: an unreadable state falls back to the config', i.box.captured.text().includes('记忆采集提醒'))
+
+const notBoolean = await (await iRoute.fetch(request({ action: 'autoCapture', on: 'yes' }))).json()
+check('switch: refuses a non-boolean', notBoolean.ok === false, notBoolean.error)
+
+// A file left over from a previous session must win over the config, or the
+// panel's own switch would be undone by the next restart. `jHome` is a fresh
+// empty home that already carries the state file a previous run left behind.
+const jHome = await mkdtemp(join(tmpdir(), 'umhome-'))
+await writeFile(join(jHome, '.autocapture'), 'off\n', 'utf8')
+process.env.DSH_HOME = jHome
+const j = makeCtx()
+await apply(j.ctx, { dir: iDir, autoCapture: true })
+await settle()
+check('switch: the state file outlives a restart and beats the config', !j.box.captured.text().includes('记忆采集提醒'))
+
+// Config says nothing, state file says nothing: OFF, and byte-identical to the
+// pre-switch behaviour (the compatibility promise of 0.5.0).
+const kHome = await mkdtemp(join(tmpdir(), 'umhome-'))
+process.env.DSH_HOME = kHome
+const k = makeCtx()
+await apply(k.ctx, { dir: iDir })
+await settle()
+check('switch: silent config + silent state = OFF', !k.box.captured.text().includes('记忆采集提醒'))
+const kLoaded = await (await k.box.route.fetch(request({ action: 'load' }))).json()
+check('switch: and it reports OFF from the config', kLoaded.autoCapture.on === false && kLoaded.autoCapture.source === 'config', JSON.stringify(kLoaded.autoCapture))
+
+if (realHome === undefined) delete process.env.DSH_HOME
+else process.env.DSH_HOME = realHome
+
+for (const x of [a, b, c, d, e, f, g, h, i, j, k]) for (const fn of x.box.disposers) if (typeof fn === 'function') fn()
 
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURE(S)`)
 process.exit(failures === 0 ? 0 : 1)

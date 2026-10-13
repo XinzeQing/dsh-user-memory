@@ -80,11 +80,24 @@ const FILES = ['rules-must.md', 'agent.md', 'profile.md', 'rules-should.md', 'lo
 let items = []
 const sent = []
 let lastResolve = null
+// Mirrors the host's runtime switch state, so the panel is driven the way the
+// real route drives it (including the `source` it reports back).
+let capture = { on: false, source: 'config' }
 
 function route(payload) {
   sent.push(payload)
   if (payload.action === 'load') {
-    return { ok: true, dir: 'C:\\Users\\Adler\\.dsh\\memory', files: FILES.map((file) => ({ file, content: '' })) }
+    return {
+      ok: true,
+      dir: 'C:\\Users\\Adler\\.dsh\\memory',
+      files: FILES.map((file) => ({ file, content: '' })),
+      autoCapture: capture,
+    }
+  }
+  if (payload.action === 'autoCapture') {
+    if (typeof payload.on !== 'boolean') return { ok: false, error: '开关状态必须是布尔值' }
+    capture = { on: payload.on, source: 'panel' }
+    return { ok: true, autoCapture: capture }
   }
   if (payload.action === 'suggestions') {
     return { ok: true, items, pending: items.filter((i) => i.status === 'pending').length }
@@ -243,6 +256,42 @@ items = [
 await poll()
 check('panel: a delivered card has no 撤销采纳 button', buttonByText('撤销采纳') === undefined)
 check('panel: the delivered card explains why it cannot be revoked', text().includes('已经交到我下一轮了'))
+
+// ---------- 8. the auto-capture switch ----------
+// The switch must be usable the moment the panel opens, and must never show a
+// state it merely assumes: it renders what the host reported.
+const switchButton = () => buttonByText('自动采集记忆：')
+check('panel: the switch is visible without opening any tab', switchButton() !== undefined)
+check('panel: it shows the state the host reported', switchButton().textContent.includes('已关闭'), switchButton().textContent)
+check(
+  'panel: a config-driven state says where it came from',
+  text().includes('当前状态来自插件配置'),
+)
+
+await click(switchButton())
+check(
+  'panel: clicking it sends on=true',
+  sent.some((p) => p.action === 'autoCapture' && p.on === true),
+  JSON.stringify(sent.filter((p) => p.action === 'autoCapture')),
+)
+check('panel: the button flips to 已开启', switchButton().textContent.includes('已开启'), switchButton().textContent)
+check(
+  'panel: it promises the change applies without a restart',
+  text().includes('下一轮对话起'),
+)
+
+// An agent proposing something is independent of the switch: turning it on must
+// not touch the waiting area.
+check('panel: flipping the switch sends no suggestion decision', sent.every((p) => p.action !== 'resolveSuggestion' || p.id === '7'))
+
+await click(switchButton())
+check(
+  'panel: clicking again sends on=false',
+  sent.filter((p) => p.action === 'autoCapture').length === 2 && sent[sent.length - 1].on === false,
+  JSON.stringify(sent[sent.length - 1]),
+)
+check('panel: the button is back to 已关闭', switchButton().textContent.includes('已关闭'), switchButton().textContent)
+check('panel: a panel-driven state drops the config wording', !text().includes('当前状态来自插件配置'))
 
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURE(S)`)
 process.exit(failures === 0 ? 0 : 1)

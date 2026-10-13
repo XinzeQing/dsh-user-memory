@@ -51,6 +51,24 @@ const MAX_CONTENT_BYTES = 256 * 1024
 const SOURCE_KIND = 'plugin:dsh-user-memory'
 /** Where suggestions awaiting the user's decision are persisted. */
 const SUGGEST_FILE = 'memory-suggest.json'
+/**
+ * Runtime state file for the panel's auto-capture switch: literally `on` or
+ * `off`.
+ *
+ * Why this exists at all
+ * ----------------------
+ * `config.autoCapture` is frozen at load time, so a config change can only take
+ * effect after a Harness restart — and the graphical panel cannot reach it. The
+ * panel is the obvious place for this switch, so the switch writes a file the
+ * host re-reads on every poll, and the file wins over the config. The config
+ * field stays as the fallback for profiles that predate the switch, which keeps
+ * `0.5.0` behaviour exactly intact for anyone who never touches the panel.
+ *
+ * It is deliberately NOT created at scaffold time: an absent file must keep
+ * meaning "no opinion, use the config", or a fresh install would silently
+ * override a profile that deliberately set `autoCapture: true`.
+ */
+const SWITCH_FILE = '.autocapture'
 /** Hard ceiling for one suggestion's wording. */
 const MAX_SUGGEST_CHARS = 4000
 /** Hard ceiling for the user's own supplement ("补充说明") attached to one suggestion. */
@@ -205,6 +223,20 @@ const AUTO_CAPTURE_NOTICE = [
   '- 只提你确实观察到的，不要为了凑数而提。',
 ].join('\n')
 
+/**
+ * Parse the panel switch's state file.
+ *
+ * Returns `true`/`false` for a recognised word, and `null` for "no opinion"
+ * (missing file, empty file, or anything unrecognised) — `null` is what lets the
+ * caller fall back to the config instead of silently forcing the switch off.
+ */
+function parseSwitch(raw) {
+  const value = String(raw ?? '').trim().toLowerCase()
+  if (value === 'on' || value === '1' || value === 'true') return true
+  if (value === 'off' || value === '0' || value === 'false') return false
+  return null
+}
+
 /** Create the memory directory and any missing template; never overwrite. */
 async function scaffold(dir) {
   await mkdir(dir, { recursive: true })
@@ -306,7 +338,20 @@ export async function apply(ctx, config = {}) {
       : DEFAULT_MAX_CHARS
   // Opt-in: off unless the config literally says `true`, so an untouched profile
   // injects exactly the bytes it injected before this field existed.
-  const autoCapture = config.autoCapture === true
+  const configAutoCapture = config.autoCapture === true
+
+  // The panel switch lives in its own file, because `config` is a load-time
+  // snapshot the panel cannot reach and a restart must not be required to flip a
+  // boolean. `null` = the file has no opinion yet, so the config above decides.
+  const switchPath = join(home, SWITCH_FILE)
+  let switchState = null
+  let autoCapture = configAutoCapture
+  let refreshing = false
+
+  const readSwitch = async () => {
+    const raw = await readFile(switchPath, 'utf8').catch(() => '')
+    return parseSwitch(raw)
+  }
 
   try {
     await scaffold(dir)
@@ -528,17 +573,33 @@ export async function apply(ctx, config = {}) {
   // byte-identical, which keeps prompt caching intact.
   let text = ''
 
+  // Reads the files and republishes `text`. Never called concurrently with
+  // itself: `refresh` guards it, and the switch action awaits it directly.
+  const reload = async () => {
+    switchState = await readSwitch()
+    autoCapture = switchState === null ? configAutoCapture : switchState
+    const parts = []
+    for (const spec of SECTIONS) {
+      const raw = await readFile(join(dir, spec.file), 'utf8').catch(() => '')
+      const body = stripComments(raw)
+      if (meaningful(body)) parts.push({ title: spec.title, body })
+    }
+    text = render(parts, maxChars) + (autoCapture ? AUTO_CAPTURE_NOTICE : '')
+  }
+
   const refresh = async () => {
+    // Single-flight: the panel's own actions also call this, and a poll may
+    // already be running. Overlapping runs could publish an older file's text
+    // (a real ordering hazard, not a theoretical one, since both legs await
+    // reads). A skipped round is fine — the next poll is 3 s away.
+    if (refreshing) return
+    refreshing = true
     try {
-      const parts = []
-      for (const spec of SECTIONS) {
-        const raw = await readFile(join(dir, spec.file), 'utf8').catch(() => '')
-        const body = stripComments(raw)
-        if (meaningful(body)) parts.push({ title: spec.title, body })
-      }
-      text = render(parts, maxChars) + (autoCapture ? AUTO_CAPTURE_NOTICE : '')
+      await reload()
     } catch (error) {
       ctx.logger?.warn?.(`user-memory: read failed, keeping previous text: ${String(error)}`)
+    } finally {
+      refreshing = false
     }
   }
 
@@ -572,13 +633,52 @@ export async function apply(ctx, config = {}) {
         const content = await readFile(join(dir, file), 'utf8').catch(() => '')
         files.push({ file, content })
       }
-      return Response.json({ ok: true, dir, files, suggestFile: suggestPath })
+      return Response.json({
+        ok: true,
+        dir,
+        files,
+        suggestFile: suggestPath,
+        // `source` tells the panel WHY the switch reads the way it does, so a
+        // profile that turned it on in the config is not displayed as "off".
+        autoCapture: { on: autoCapture, source: switchState === null ? 'config' : 'panel' },
+      })
     }
 
     // Read the waiting area. The agent can only ever add to it; only the panel
     // can decide.
     if (action === 'suggestions') {
       return Response.json({ ok: true, items: store.items, pending: pendingCount() })
+    }
+
+    // The auto-capture switch. It writes exactly one word to one file this
+    // plugin owns, then refreshes so the change reaches the NEXT model step
+    // rather than waiting out the poll — the point of a switch is that flipping
+    // it does something visible immediately.
+    if (action === 'autoCapture') {
+      const want = payload?.on
+      if (typeof want !== 'boolean') {
+        return Response.json({ ok: false, error: '开关状态必须是布尔值' }, { status: 400 })
+      }
+      try {
+        await mkdir(home, { recursive: true })
+        await writeFile(switchPath, want ? 'on\n' : 'off\n', 'utf8')
+      } catch (error) {
+        ctx.logger?.warn?.(`user-memory: switch write failed ${switchPath}: ${String(error)}`)
+        return Response.json({ ok: false, error: '写入开关失败，请查看日志' }, { status: 500 })
+      }
+      // Publish the new state before reloading: the section provider is
+      // synchronous and could be read mid-reload, so this keeps the switch and
+      // the injected notice from ever disagreeing. `reload` is called directly
+      // rather than through `refresh`, because a poll holding the single-flight
+      // guard would make `refresh` skip and leave the old text in place.
+      switchState = want
+      autoCapture = want
+      try {
+        await reload()
+      } catch (error) {
+        ctx.logger?.warn?.(`user-memory: switch reload failed: ${String(error)}`)
+      }
+      return Response.json({ ok: true, autoCapture: { on: autoCapture, source: 'panel' } })
     }
 
     if (action === 'resolveSuggestion') {

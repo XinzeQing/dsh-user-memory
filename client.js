@@ -68,6 +68,9 @@ window.__ModuleLoader__.load({
       '.umem-note:disabled{opacity:.6;}',
       '.umem-note::placeholder{color:var(--dsw-alias-label-tertiary);}',
       '.umem-note-ro{margin-top:10px;font-size:12px;line-height:1.7;color:var(--dsw-alias-label-secondary);white-space:pre-wrap;word-break:break-word;border-left:2px solid var(--dsw-alias-border-l1);padding-left:8px;}',
+      '.umem-switch{display:flex;align-items:flex-start;gap:10px;margin-top:10px;padding-top:10px;border-top:1px dashed var(--dsw-alias-border-l1);}',
+      '.umem-switch .umem-btn{flex:none;}',
+      '.umem-switch-note{font-size:12px;line-height:1.7;color:var(--dsw-alias-label-tertiary);}',
     ].join('\n');
 
     async function call(action, extra) {
@@ -117,6 +120,10 @@ window.__ModuleLoader__.load({
       const [suggestions, setSuggestions] = useState([]);
       const [notes, setNotes] = useState({});
       const [busyId, setBusyId] = useState('');
+      // The auto-capture switch. `null` = still loading, so the button never
+      // flashes a wrong state before the first response arrives.
+      const [capture, setCapture] = useState(null);
+      const [captureBusy, setCaptureBusy] = useState(false);
 
       const load = useCallback(async () => {
         setStatus('loading');
@@ -128,6 +135,11 @@ window.__ModuleLoader__.load({
           setSaved(map);
           setDrafts(map);
           setDir(data.dir || '');
+          setCapture(
+            data.autoCapture && typeof data.autoCapture.on === 'boolean'
+              ? { on: data.autoCapture.on, source: data.autoCapture.source || '' }
+              : { on: false, source: '' },
+          );
           setStatus('ready');
         } catch (error) {
           setStatus('error');
@@ -185,6 +197,29 @@ window.__ModuleLoader__.load({
       );
 
       const dirty = FILES.some((entry) => (drafts[entry.file] || '') !== (saved[entry.file] || ''));
+
+      // The switch is the only control that must act the moment it is clicked:
+      // it writes the state file on the host and the host re-publishes the
+      // injected block from it, with no restart in between.
+      const flipCapture = useCallback(async function (next) {
+        setCaptureBusy(true);
+        try {
+          const data = await call('autoCapture', { on: next });
+          if (!data || data.ok !== true) throw new Error((data && data.error) || '设置失败');
+          setCapture({ on: data.autoCapture.on, source: data.autoCapture.source || '' });
+          setMessage({
+            kind: 'ok',
+            text:
+              next
+                ? '记忆采集已开启：我从下一轮对话起会主动提议值得长期记住的偏好（仍然只进「待确认」，要你点「采纳」才写）。'
+                : '记忆采集已关闭：我不再主动提议，系统提示词回到逐字节和以前一样。',
+          });
+        } catch (error) {
+          setMessage({ kind: 'err', text: '设置失败：' + String(error && error.message ? error.message : error) });
+        } finally {
+          setCaptureBusy(false);
+        }
+      }, []);
 
       const save = useCallback(async () => {
         setSaving(true);
@@ -425,6 +460,33 @@ window.__ModuleLoader__.load({
           { className: 'umem-head' },
           h('div', { className: 'umem-title' }, '长期记忆'),
           h('div', { className: 'umem-sub' }, '文件位置：' + (dir || '（未知）')),
+          h(
+            'div',
+            { className: 'umem-switch' },
+            h(
+              'button',
+              {
+                className: 'umem-btn',
+                disabled: capture === null || captureBusy,
+                onClick: function () {
+                  if (capture === null) return;
+                  void flipCapture(!capture.on);
+                },
+              },
+              h('span', {
+                className: 'umem-dot',
+                style: capture && capture.on ? { background: 'var(--dsw-alias-state-success-primary)' } : null,
+              }),
+              '自动采集记忆：' + (capture === null ? '读取中…' : capture.on ? '已开启' : '已关闭'),
+            ),
+            h(
+              'div',
+              { className: 'umem-switch-note' },
+              capture && capture.source === 'config'
+                ? '当前状态来自插件配置（配置文件里写了 autoCapture），点一下就用面板的设置覆盖它。'
+                : '开启后，我会在对话里主动提议值得长期记住的偏好——提议只进「待确认」，你点「采纳」才会写进记忆。',
+            ),
+          ),
         ),
         h(
           'div',
