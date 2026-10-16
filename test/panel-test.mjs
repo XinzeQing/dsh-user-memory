@@ -83,6 +83,18 @@ let lastResolve = null
 // Mirrors the host's runtime switch state, so the panel is driven the way the
 // real route drives it (including the `source` it reports back).
 let capture = { on: false, source: 'config' }
+// The 临时记忆 store, mirrored the same way: the panel is only a view over it.
+let tempStore = { nextId: 1, items: [] }
+const tempOpen = () => tempStore.items.filter((i) => i.status === 'open').length
+const tempReply = () => ({
+  ok: true,
+  enabled: true,
+  path: 'C:\\Users\\Adler\\.dsh\\temp-memory.json',
+  // Fresh objects per response, like the real route: the panel is handed a new
+  // array every time, so React cannot bail out on an identical reference.
+  items: tempStore.items.map((item) => Object.assign({}, item)),
+  open: tempOpen(),
+})
 
 function route(payload) {
   sent.push(payload)
@@ -115,6 +127,48 @@ function route(payload) {
       item.status = 'dismissed'
     }
     return { ok: true, id: payload.id, status: item.status, userNote: item.userNote || '', pending: 0 }
+  }
+  if (payload.action === 'tempLoad') return tempReply()
+  if (payload.action === 'tempSave') {
+    const id = payload.id === '' || payload.id === undefined ? String(tempStore.nextId++) : payload.id
+    const existing = tempStore.items.find((i) => i.id === id)
+    const now = '2026-10-16T00:20:00.000Z'
+    if (existing) {
+      existing.kind = payload.kind
+      existing.title = payload.title
+      existing.body = payload.body
+      existing.updatedAt = now
+    } else {
+      tempStore.items.push({
+        id,
+        kind: payload.kind,
+        title: payload.title,
+        body: payload.body,
+        status: 'open',
+        createdAt: now,
+        updatedAt: now,
+      })
+    }
+    return Object.assign({ id }, tempReply())
+  }
+  if (payload.action === 'tempDone') {
+    const item = tempStore.items.find((i) => i.id === payload.id)
+    if (payload.done === false) {
+      item.status = 'open'
+      delete item.doneAt
+    } else {
+      item.status = 'done'
+      item.doneAt = '2026-10-16T00:21:00.000Z'
+    }
+    return tempReply()
+  }
+  if (payload.action === 'tempDelete') {
+    tempStore.items = tempStore.items.filter((i) => i.id !== payload.id)
+    return tempReply()
+  }
+  if (payload.action === 'tempCleanup') {
+    tempStore.items = tempStore.items.filter((i) => i.status !== 'done')
+    return tempReply()
   }
   return { ok: false, error: 'unknown action' }
 }
@@ -159,13 +213,31 @@ const click = async (el) => {
 const buttonByText = (text) =>
   [...container.querySelectorAll('button')].find((b) => b.textContent.trim().startsWith(text))
 const setValue = Object.getOwnPropertyDescriptor(w.HTMLTextAreaElement.prototype, 'value').set
+const setInputValue = Object.getOwnPropertyDescriptor(w.HTMLInputElement.prototype, 'value').set
 const type = async (el, value) => {
   await flush(() => {
     setValue.call(el, value)
     el.dispatchEvent(new w.Event('input', { bubbles: true }))
   })
 }
-const poll = () => flush(() => { intervals[intervals.length - 1].fn() })
+// The temp form's title is an <input>, not a <textarea>; React listens on the
+// same 'input' event either way.
+const textType = async (el, value) => {
+  await flush(() => {
+    setInputValue.call(el, value)
+    el.dispatchEvent(new w.Event('input', { bubbles: true }))
+  })
+}
+// Fire the panel's poll. The polled load is async (`void loadTemp()`), so the
+// interval handler returns before its state update commits: flush a couple more
+// times so the test observes the panel the way the next frame would.
+const poll = async () => {
+  await flush(() => {
+    intervals[intervals.length - 1].fn()
+  })
+  await flush()
+  await flush()
+}
 const text = () => container.textContent || ''
 
 items = [{ id: '7', file: 'rules-must.md', text: '回答短一点。', why: '用户说了三次', status: 'pending' }]
@@ -292,6 +364,107 @@ check(
 )
 check('panel: the button is back to 已关闭', switchButton().textContent.includes('已关闭'), switchButton().textContent)
 check('panel: a panel-driven state drops the config wording', !text().includes('当前状态来自插件配置'))
+
+// ---------- 9. the 临时记忆 tab ----------
+// It must sit before 待确认 (the pending tab is found by position), show the
+// store the host reports, and route every action through the host.
+const TAB_LABELS = ['必须遵守', '行为设定', '用户画像', '可选遵守', '变更日志', '临时记忆', '待确认']
+const tabButtons = () =>
+  [...container.querySelectorAll('button')].filter((b) =>
+    TAB_LABELS.some((t) => b.textContent.trim().startsWith(t)),
+  )
+const tabIndex = (label) => tabButtons().findIndex((b) => b.textContent.trim().startsWith(label))
+check(
+  'panel: the 临时记忆 tab is a tab of its own, and 待确认 stays last',
+  tabIndex('临时记忆') >= 0 && tabIndex('临时记忆') < tabIndex('待确认') && tabButtons().length === TAB_LABELS.length,
+  tabButtons().map((b) => b.textContent.trim()).join(' / '),
+)
+
+await click(buttonByText('临时记忆'))
+check('panel: an empty store says so, and says why it stays empty', text().includes('临时记忆是空的') && text().includes('只有在明确要求时才写'))
+check('panel: the form offers all three kinds', container.querySelectorAll('.umem-select option').length === 3)
+const titleBox = container.querySelector('.umem-input')
+const bodyBox = container.querySelector('.umem-bigt')
+check(
+  'panel: the form explains what a handoff entry is for',
+  titleBox !== null && bodyBox !== null && bodyBox.placeholder.includes('交付文档'),
+)
+
+// Nothing may be written just by typing.
+await textType(titleBox, '临时记忆面板')
+await type(bodyBox, '## 交给谁\n下一步')
+check('panel: typing sends no tempSave', sent.every((p) => p.action !== 'tempSave'))
+
+await click(buttonByText('新增一条'))
+check(
+  'panel: 新增一条 sends kind+title+body to tempSave as a new entry',
+  sent.some(
+    (p) => p.action === 'tempSave' && p.id === '' && p.kind === 'handoff' && p.title === '临时记忆面板',
+  ),
+  JSON.stringify(sent.filter((p) => p.action === 'tempSave')),
+)
+check('panel: the confirmation names the id and how it goes away', text().includes('已新增 #1') && text().includes('标记完成'))
+check('panel: the card renders the entry with its kind label', text().includes('#1') && text().includes('交接'))
+check('panel: the open count is shown next to the store path', text().includes('当前活跃 1 条'))
+check('panel: a card offers 标记完成 / 编辑 / 删除', buttonByText('标记完成') !== undefined && buttonByText('编辑') !== undefined && buttonByText('删除') !== undefined)
+
+// 编辑 loads the card into the form instead of writing immediately.
+await click(buttonByText('编辑'))
+check(
+  'panel: 编辑 loads the card into the form and says so',
+  container.querySelector('.umem-input').value === '临时记忆面板' && text().includes('正在编辑 #1'),
+)
+check('panel: an editing form offers 保存修改 and 取消编辑', buttonByText('保存修改') !== undefined && buttonByText('取消编辑') !== undefined)
+await click(buttonByText('取消编辑'))
+check('panel: 取消编辑 restores the 新增 form', buttonByText('新增一条') !== undefined && container.querySelector('.umem-input').value === '')
+
+// 标记完成 is the whole point: it must say the entry leaves the injection.
+await click(buttonByText('标记完成'))
+check(
+  'panel: 标记完成 sends done=true for that id',
+  sent.some((p) => p.action === 'tempDone' && p.id === '1' && p.done === true),
+  JSON.stringify(sent.filter((p) => p.action === 'tempDone')),
+)
+check('panel: the message promises the entry leaves the injection but stays', text().includes('立刻从注入里消失') && text().includes('随时能恢复'))
+check('panel: an archived card can be 恢复为活跃 again', buttonByText('恢复为活跃') !== undefined)
+check('panel: archived entries are listed as no longer injected, with 清空归档', text().includes('归档 1 条（不再注入）') && buttonByText('清空归档') !== undefined)
+check('panel: the store holds no open entry now', text().includes('当前活跃 0 条'))
+
+await click(buttonByText('恢复为活跃'))
+check(
+  'panel: 恢复为活跃 sends done=false',
+  sent.some((p) => p.action === 'tempDone' && p.id === '1' && p.done === false),
+)
+check('panel: the entry is open again', text().includes('当前活跃 1 条'))
+
+await click(buttonByText('标记完成'))
+await click(buttonByText('清空归档'))
+check(
+  'panel: 清空归档 sends tempCleanup and drops the archived card',
+  sent.some((p) => p.action === 'tempCleanup') && !text().includes('#1'),
+)
+
+// The temp tab polls the host too, so changes made elsewhere show up.
+tempStore.items.push({
+  id: '9',
+  kind: 'waiting',
+  title: '等 CI 结果',
+  body: '等流水线跑完再继续。',
+  status: 'open',
+  createdAt: '2026-10-16T00:30:00.000Z',
+  updatedAt: '2026-10-16T00:30:00.000Z',
+})
+check('panel: the store changed behind the panel and nothing moved yet', !text().includes('等 CI 结果'))
+await poll()
+check('panel: the 5s poll on the temp tab picks up an entry written elsewhere', text().includes('等 CI 结果') && text().includes('等待项'))
+check('panel: the tab badge carries the open count', buttonByText('临时记忆').textContent.includes('1'))
+
+// 删除 is the only destructive one: it must say the archive goes too.
+await click(buttonByText('删除'))
+check(
+  'panel: 删除 sends tempDelete and says the archive goes with it',
+  sent.some((p) => p.action === 'tempDelete' && p.id === '9') && text().includes('连归档一起'),
+)
 
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURE(S)`)
 process.exit(failures === 0 ? 0 : 1)

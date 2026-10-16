@@ -6,6 +6,14 @@
 #   maxChars - total character budget for the injected block
 #   autoCapture - false (default) injects nothing extra; true appends a fixed
 #                 reminder telling the model to propose memory_suggest entries
+#   tempMemory  - false (default) keeps the prompt byte-identical to 0.6.0; true
+#                 mounts a SECOND section with the temporary working set
+#                 (cross-session handoffs, stage goals, waiting items) and the two
+#                 temp_memory / temp_memory_done tools. Entries leave the prompt
+#                 the moment they are archived.
+#   tempMaxChars - character budget for that second section ONLY. It is separate
+#                 on purpose: the user's own `maxChars` must not pay for working
+#                 notes. Empty/absent means the built-in default (1200).
 - insert:
     - id: user-memory
       name: 'dsh-user-memory'
@@ -14,3 +22,5 @@
         dir: ''
         maxChars: 6000
         autoCapture: false
+        tempMemory: false
+        tempMaxChars: 1200

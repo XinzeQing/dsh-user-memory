@@ -20,6 +20,16 @@
  * Beyond creating missing templates once (never overwriting), it never captures
  * a conversation, never summarises, never writes back on its own, and never
  * sends memory anywhere.
+ *
+ * 临时记忆 (temporary memory) — a second, separable layer
+ * ------------------------------------------------------
+ * The files above are permanent rules the user authors. The working set is the
+ * other half of a session's memory: "hand this to another conversation", "this is
+ * the stage I am in", "do X once Y lands". It lives in one store beside the
+ * suggestion store, is injected as its OWN section (`TEMP_SECTION_NAME`, order
+ * -490), and every entry is either open or archived — an archived entry leaves
+ * the prompt immediately, which is what keeps this layer from becoming a second
+ * long-term memory. Off unless `config.tempMemory === true`.
  */
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -75,6 +85,47 @@ const MAX_SUGGEST_CHARS = 4000
 const MAX_NOTE_CHARS = 1000
 /** Decided suggestions are pruned once the store grows past this. */
 const MAX_KEPT_ITEMS = 80
+
+// ---- 临时记忆（活跃工作集） ---------------------------------------------------
+//
+// A SECOND, separable layer: the user's own long-term memory is permanent rules
+// and a profile, while this is the working set — "what I am doing right now",
+// "hand this to another conversation", "do X once Y lands". It is cross-session
+// (one store, above every conversation), auto-injected, and per-item: an entry
+// leaves the prompt the moment it is finished, which is what keeps the layer
+// from growing into a second long-term memory.
+//
+// Two things ride on this being a SEPARATE section rather than another heading
+// inside the long-term block:
+//  1. the long-term preamble says "written and maintained by the user" — that
+//     would be a lie for entries a model wrote at the user's request; and
+//  2. `maxChars` (the user's own budget) must not be eaten by working notes.
+const TEMP_SECTION_NAME = 'user-memory-temp'
+/** Immediately after the long-term block (-500), still above the persona (0). */
+const TEMP_SECTION_ORDER = -490
+/** One JSON store beside the suggestion store, not inside the memory dir. */
+const TEMP_FILE = 'temp-memory.json'
+/**
+ * The three kinds exist because their readers and their lifetimes differ:
+ * `handoff` is read by ANOTHER conversation, `stage` by every conversation for
+ * as long as the stage lasts, `waiting` mostly by the one that created it.
+ */
+const TEMP_KINDS = ['handoff', 'stage', 'waiting']
+const TEMP_KIND_TITLES = { handoff: '交接', stage: '阶段目标', waiting: '等待项' }
+/** Independent budget: this block never touches `maxChars`. */
+const DEFAULT_TEMP_MAX_CHARS = 1200
+/**
+ * Hard ceiling for one body, and deliberately NOT a soft target: a handoff entry
+ * doubles as a delivery document, so it is allowed to be long. This only stops a
+ * runaway paste.
+ */
+const MAX_TEMP_BODY_CHARS = 8000
+const MAX_TEMP_TITLE_CHARS = 200
+/** Open entries are never pruned; finished ones are capped by count AND age. */
+const TEMP_ARCHIVE_KEEP = 20
+const TEMP_ARCHIVE_DAYS = 30
+/** Room reserved inside the temp budget for the "not injected, see the file" note. */
+const TEMP_NOTE_RESERVE = 120
 
 /** Injected order: behaviour-shaping first, descriptive later, soft last. */
 const SECTIONS = [
@@ -214,6 +265,77 @@ function render(parts, maxChars) {
  *  2. it sits OUTSIDE `maxChars`, so the user's own text keeps its full budget.
  * A disabled switch appends `''`, leaving the prompt byte-identical.
  */
+// ---- 临时记忆：注入时怎么渲染 -------------------------------------------------
+
+/** The block header. Constant text: it must never depend on the entries. */
+const TEMP_PREAMBLE = [
+  '## 临时记忆（活跃工作集）',
+  '',
+  '以下条目是**还没做完的事**，由用户在对话里要求写入：跨对话交接、当前阶段目标、等到某个条件就要执行的待办。',
+  '它们不是永久规则，也不是参考资料，做完就会被清理掉。',
+].join('\n')
+
+/**
+ * Appended only while a 等待 entry is open, and constant on purpose: the waiting
+ * semantics have to be stated ONCE as a rule, not repeated on every entry, or a
+ * full working set would spend its budget restating the same paragraph.
+ */
+const TEMP_WAITING_NOTICE = [
+  '',
+  '### 等待项',
+  '',
+  '- 上面若有「等待」条目，且它等的条件已经满足：直接执行，做完调 `temp_memory_done` 把它归档，它就不再出现在这里。',
+  '- 条件没满足就不要动它，也不要为了确认反复问用户。',
+].join('\n')
+
+const tempHeading = (item) => `[${TEMP_KIND_TITLES[item.kind] || item.kind} #${item.id}] ${item.title}`
+
+/**
+ * Renders the temp block. The three rules that make this layer safe to leave on:
+ *  - newest first, so the freshest handoff is the one that survives a full budget;
+ *  - an entry that does not fit is NOT half-injected, only named — a truncated
+ *    delivery document is worse than a pointer plus the store path;
+ *  - with nothing changed, the output is byte-identical to the previous step's
+ *    (the waiting notice is constant), which keeps prompt caching intact.
+ */
+const renderTemp = (items, maxChars, storePath) => {
+  const open = items
+    .filter((item) => item.status === 'open')
+    .sort((a, b) =>
+      String(b.updatedAt || b.createdAt).localeCompare(String(a.updatedAt || a.createdAt)),
+    )
+  if (open.length === 0) return ''
+  const budget = maxChars - TEMP_PREAMBLE.length - 2 - TEMP_NOTE_RESERVE
+  if (budget <= 0) return ''
+  let body = ''
+  const skipped = []
+  for (const item of open) {
+    const chunk = `\n\n### ${tempHeading(item)}\n\n${item.body}`
+    if (body.length + chunk.length <= budget) {
+      body += chunk
+      continue
+    }
+    skipped.push(item.id)
+  }
+  if (body === '') {
+    // Nothing fits at all: one oversized handoff, or a budget the user shrank.
+    // An index still beats silence — the model learns the entry exists, and where
+    // to read it in full.
+    return (
+      TEMP_PREAMBLE +
+      `\n\n（临时记忆预算 ${maxChars} 字符，装不下任何一条全文：#${open
+        .map((item) => item.id)
+        .join('、#')}；全文见 ${storePath}）`
+    )
+  }
+  const note =
+    skipped.length === 0
+      ? ''
+      : `\n\n（预算已满，另有 ${skipped.length} 条没有注入：#${skipped.join('、#')}；全文见 ${storePath}）`
+  const waiting = open.some((item) => item.kind === 'waiting') ? TEMP_WAITING_NOTICE : ''
+  return TEMP_PREAMBLE + body + note + waiting
+}
+
 const AUTO_CAPTURE_NOTICE = [
   '',
   '## 记忆采集提醒（开关已打开）',
@@ -421,6 +543,77 @@ export async function apply(ctx, config = {}) {
 
   await loadStore()
 
+  // ---- 临时记忆（活跃工作集）：存储 --------------------------------------------
+  //
+  // Off unless the config opts in. With the switch off, the system prompt stays
+  // byte-identical to 0.6.0 — the same compatibility promise the auto-capture
+  // switch keeps, because a plugin that silently grows the user's prompt is a
+  // plugin the user cannot measure.
+  const tempEnabled = config.tempMemory === true
+  const tempMaxChars =
+    typeof config.tempMaxChars === 'number' &&
+    Number.isFinite(config.tempMaxChars) &&
+    config.tempMaxChars > 0
+      ? config.tempMaxChars
+      : DEFAULT_TEMP_MAX_CHARS
+  // Beside the suggestion store, NOT inside the memory dir: the memory dir holds
+  // the user's hand-written files, and a file a model can grow through a tool
+  // does not belong in that list.
+  const tempPath = join(home, TEMP_FILE)
+  let tempStore = { nextId: 1, items: [] }
+
+  /** Same tolerance as the suggestion store: unreadable means empty, never fatal. */
+  const loadTempStore = async () => {
+    try {
+      const parsed = JSON.parse(await readFile(tempPath, 'utf8'))
+      if (parsed !== null && typeof parsed === 'object' && Array.isArray(parsed.items)) {
+        tempStore = {
+          nextId:
+            Number.isInteger(parsed.nextId) && parsed.nextId > 0
+              ? parsed.nextId
+              : parsed.items.length + 1,
+          items: parsed.items.filter((item) => item !== null && typeof item === 'object'),
+        }
+      }
+    } catch {
+      // No store yet — and none is created until the first entry is written, so
+      // merely enabling the feature leaves the disk untouched.
+    }
+  }
+
+  const saveTempStore = async () => {
+    try {
+      await mkdir(home, { recursive: true })
+      await writeFile(tempPath, JSON.stringify(jsonSafe(tempStore), null, 2), 'utf8')
+    } catch (error) {
+      ctx.logger?.warn?.(`user-memory: 临时记忆写入失败 ${tempPath}: ${String(error)}`)
+    }
+  }
+
+  const openTempCount = () => tempStore.items.filter((item) => item.status === 'open').length
+
+  /**
+   * Open entries are immortal — an unfinished handoff is exactly the thing that
+   * must survive — while finished ones are capped by age and then by count, so
+   * the archive stays readable without a manual cleanup step.
+   */
+  const pruneTemp = () => {
+    const cutoff = Date.now() - TEMP_ARCHIVE_DAYS * 24 * 60 * 60 * 1000
+    const open = tempStore.items.filter((item) => item.status !== 'done')
+    const finished = tempStore.items
+      .filter((item) => item.status === 'done')
+      .filter((item) => {
+        const at = Date.parse(String(item.doneAt || item.createdAt))
+        return Number.isNaN(at) ? true : at >= cutoff
+      })
+      .slice(-TEMP_ARCHIVE_KEEP)
+    tempStore.items = open
+      .concat(finished)
+      .sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)))
+  }
+
+  await loadTempStore()
+
   /**
    * `ctx.tools.register()` takes a finished JSON Schema, not the `defineTool`
    * spec form. Passing the spec form — as this plugin did at first, i.e.
@@ -540,12 +733,149 @@ export async function apply(ctx, config = {}) {
     },
   }
 
+  // ---- 临时记忆：模型侧的两个工具 ----------------------------------------------
+  //
+  // Both exist because the panel cannot be reached from a conversation and the
+  // file cannot be edited by hand mid-task. The WRITE side is deliberately
+  // gated in its own description — the store must not grow because the model
+  // found it useful, which is the whole reason the user asked for a gate.
+  const tempTool = {
+    name: 'temp_memory',
+    description:
+      '把一条「临时记忆」写进跨对话的活跃工作集（会自动注入到之后的每一步上下文里）。**只在用户明确要求时调用**：' +
+      '他说「写临时记忆 / 记到临时记忆 / 交付记忆 / 换会话执行 / 下次对话接着做」，或让你把某件事记下来交给别的对话。' +
+      '除此之外一律不要调用——不要在你觉得有用时写，不要自动总结，不要顺手记，否则会吃满他的上下文预算。' +
+      'kind：handoff=交接（给另一个对话的交付信息）、stage=阶段目标（眼下在做的事，减少重复说明）、' +
+      'waiting=等待项（等条件满足再执行）。交接条目同时是交付文档，正文可以写长、写全。',
+    parameters: toolSchema({
+      kind: {
+        type: 'string',
+        required: true,
+        enum: TEMP_KINDS,
+        description: '条目类型：handoff / stage / waiting。',
+      },
+      title: {
+        type: 'string',
+        required: true,
+        description: `一句话标题，写清是什么事（不超过 ${MAX_TEMP_TITLE_CHARS} 字）。`,
+      },
+      body: {
+        type: 'string',
+        required: true,
+        description:
+          '正文，markdown。交接条目按「目标 / 现状 / 下一步 / 关键路径 / 验收标准」写全，它是交付文档；' +
+          '等待条目写清「等什么条件」和「条件满足后做什么」。',
+      },
+    }),
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          id: { type: 'string' },
+          kind: { type: 'string' },
+          status: { type: 'string' },
+          open: { type: 'integer' },
+        },
+        required: ['id', 'kind', 'status', 'open'],
+      },
+      render: (args, value) => [
+        {
+          type: 'text',
+          text:
+            `临时记忆 #${value.id}（${TEMP_KIND_TITLES[value.kind] || value.kind}）已写入，` +
+            `当前活跃 ${value.open} 条。它在下一步上下文里就会出现在「临时记忆」一节；` +
+            '做完之后调 temp_memory_done 归档，它才会从注入里消失。',
+        },
+      ],
+    },
+    execute: async (args) => {
+      if (!tempEnabled) throw new Error('临时记忆未启用：插件配置里的 tempMemory 没有打开')
+      const kind = typeof args?.kind === 'string' ? args.kind : ''
+      if (!TEMP_KINDS.includes(kind)) throw new Error(`不允许的条目类型：${kind || '(空)'}`)
+      const title =
+        typeof args?.title === 'string' ? args.title.trim().slice(0, MAX_TEMP_TITLE_CHARS) : ''
+      const body = typeof args?.body === 'string' ? args.body.trim() : ''
+      if (title === '') throw new Error('标题不能为空')
+      if (body === '') throw new Error('正文不能为空（交接条目至少写清目标、现状、下一步）')
+      const id = String(tempStore.nextId++)
+      const now = new Date().toISOString()
+      tempStore.items.push({
+        id,
+        kind,
+        title,
+        // A long body is allowed on purpose (a handoff is a delivery document);
+        // this only stops a runaway paste.
+        body: body.slice(0, MAX_TEMP_BODY_CHARS),
+        status: 'open',
+        createdAt: now,
+        updatedAt: now,
+      })
+      pruneTemp()
+      await saveTempStore()
+      await refresh()
+      return { id, kind, status: 'open', open: openTempCount() }
+    },
+  }
+
+  const tempDoneTool = {
+    name: 'temp_memory_done',
+    description:
+      '把一条临时记忆标记为完成并归档：它立刻从注入里消失，这就是「完成即清理」。' +
+      '做完一条交接或等待项之后调用；如果决定不做、或条目已经过时，也用它归档，并把原因写进 note。' +
+      '不删数据——归档条目仍能在面板里看到，需要时也能恢复。',
+    parameters: toolSchema({
+      id: { type: 'string', required: true, description: '条目编号，来自临时记忆里的 #编号。' },
+      note: {
+        type: 'string',
+        description: '结果一句话：做完了什么、交付物在哪，或为什么不做。',
+      },
+    }),
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          id: { type: 'string' },
+          status: { type: 'string' },
+          open: { type: 'integer' },
+        },
+        required: ['id', 'status', 'open'],
+      },
+      render: (args, value) => [
+        {
+          type: 'text',
+          text: `临时记忆 #${value.id} 已归档，当前活跃 ${value.open} 条。`,
+        },
+      ],
+    },
+    execute: async (args) => {
+      const id = typeof args?.id === 'string' ? args.id : String(args?.id ?? '')
+      const item = tempStore.items.find((entry) => entry.id === id)
+      if (item === undefined) throw new Error(`找不到临时记忆 #${id}`)
+      item.status = 'done'
+      item.note = typeof args?.note === 'string' ? args.note.trim().slice(0, 1000) : ''
+      item.doneAt = new Date().toISOString()
+      // Prune here too, not only on create: otherwise archiving is the one write
+      // that can push the store one entry past its own cap.
+      pruneTemp()
+      await saveTempStore()
+      await refresh()
+      return { id, status: item.status, open: openTempCount() }
+    },
+  }
+
   // `ctx.tools.register` is the same seat `@nanmicoder/dsh-agent-teams` uses
   // (`lib/tools.js:572`). The earlier `ctx.inject(['tools'], (scope) =>
   // scope.get('tools'))` form registered nothing at runtime — the tool never
   // appeared in the Agent's catalog while the plugin fiber still reported
   // `active` — so the registry is now a declared hard dependency.
-  for (const definition of [suggestTool, doneTool]) {
+  // With the feature off the tool catalog is exactly 0.6.0's: a model that never
+  // heard of 临时记忆 has no reason to write one.
+  const toolDefinitions = tempEnabled
+    ? [suggestTool, doneTool, tempTool, tempDoneTool]
+    : [suggestTool, doneTool]
+  for (const definition of toolDefinitions) {
     ctx.effect(() => ctx.tools.register(definition))
   }
 
@@ -572,6 +902,9 @@ export async function apply(ctx, config = {}) {
   // the last good result is served; an unchanged result leaves the prompt
   // byte-identical, which keeps prompt caching intact.
   let text = ''
+  // The temp working set is its own section with its own budget, so it needs its
+  // own published string; both are refreshed together by `reload`.
+  let tempText = ''
 
   // Reads the files and republishes `text`. Never called concurrently with
   // itself: `refresh` guards it, and the switch action awaits it directly.
@@ -585,6 +918,11 @@ export async function apply(ctx, config = {}) {
       if (meaningful(body)) parts.push({ title: spec.title, body })
     }
     text = render(parts, maxChars) + (autoCapture ? AUTO_CAPTURE_NOTICE : '')
+    // The temp store lives in this process, exactly like the suggestion store:
+    // it is not re-read from disk on every poll. A hand edit of the JSON lands at
+    // the next restart, which is the same rule the waiting area already follows
+    // (and why the panel, not the editor, is the supported way to change it).
+    tempText = tempEnabled ? renderTemp(tempStore.items, tempMaxChars, tempPath) : ''
   }
 
   const refresh = async () => {
@@ -621,6 +959,23 @@ export async function apply(ctx, config = {}) {
     }),
   )
 
+  // A SECOND section rather than one more heading inside the first. Two reasons,
+  // and neither is cosmetic: the long-term block's preamble says it is written by
+  // the user (untrue for entries a model wrote), and its `maxChars` budget is the
+  // user's own — working notes must not spend it.
+  // `interpolate: false`, because this text is written BY a model or typed by the
+  // user at runtime: nothing in it should ever be expanded as a template.
+  if (tempEnabled) {
+    ctx.effect(() =>
+      ctx.systemPrompt.section({
+        name: TEMP_SECTION_NAME,
+        order: TEMP_SECTION_ORDER,
+        interpolate: false,
+        text: () => tempText,
+      }),
+    )
+  }
+
   // The graphical panel's only backend. Both actions are read/write of files
   // this plugin already owns; the file name is checked against a fixed list.
   const handle = async (request) => {
@@ -641,6 +996,9 @@ export async function apply(ctx, config = {}) {
         // `source` tells the panel WHY the switch reads the way it does, so a
         // profile that turned it on in the config is not displayed as "off".
         autoCapture: { on: autoCapture, source: switchState === null ? 'config' : 'panel' },
+        // The working set rides along in the same round trip so the panel can
+        // show its own tab (path, budget state, how many are still open).
+        temp: { enabled: tempEnabled, path: tempPath, open: openTempCount() },
       })
     }
 
@@ -733,6 +1091,116 @@ export async function apply(ctx, config = {}) {
         pending: pendingCount(),
         userNote: typeof item.userNote === 'string' ? item.userNote : '',
       })
+    }
+
+    // ---- 临时记忆：面板侧的读写 --------------------------------------------------
+    //
+    // The agent's path is the two tools above. These actions exist for the panel:
+    // the user adds, corrects, finishes and deletes entries without going through
+    // a conversation, and without hand-editing a JSON file mid-task.
+    if (action === 'tempLoad') {
+      return Response.json({
+        ok: true,
+        enabled: tempEnabled,
+        path: tempPath,
+        items: tempStore.items,
+        open: openTempCount(),
+      })
+    }
+
+    if (action === 'tempSave') {
+      if (!tempEnabled) {
+        return Response.json({ ok: false, error: '临时记忆未启用（配置里的 tempMemory）' }, { status: 400 })
+      }
+      const kind = typeof payload?.kind === 'string' ? payload.kind : ''
+      if (!TEMP_KINDS.includes(kind)) {
+        return Response.json({ ok: false, error: '不允许的条目类型' }, { status: 400 })
+      }
+      const title = typeof payload?.title === 'string' ? payload.title.trim() : ''
+      const body = typeof payload?.body === 'string' ? payload.body : ''
+      if (title === '') return Response.json({ ok: false, error: '标题不能为空' }, { status: 400 })
+      if (body.trim() === '') {
+        return Response.json({ ok: false, error: '正文不能为空' }, { status: 400 })
+      }
+      if (body.length > MAX_TEMP_BODY_CHARS) {
+        return Response.json(
+          { ok: false, error: `正文过长（上限 ${MAX_TEMP_BODY_CHARS} 字符）` },
+          { status: 413 },
+        )
+      }
+      const given = payload?.id === undefined || payload?.id === null ? '' : String(payload.id)
+      const now = new Date().toISOString()
+      let targetId = given
+      if (given === '') {
+        targetId = String(tempStore.nextId++)
+        tempStore.items.push({
+          id: targetId,
+          kind,
+          title: title.slice(0, MAX_TEMP_TITLE_CHARS),
+          body,
+          status: 'open',
+          createdAt: now,
+          updatedAt: now,
+        })
+      } else {
+        const item = tempStore.items.find((entry) => entry.id === given)
+        if (item === undefined) {
+          return Response.json({ ok: false, error: `找不到临时记忆 #${given}` }, { status: 404 })
+        }
+        item.kind = kind
+        item.title = title.slice(0, MAX_TEMP_TITLE_CHARS)
+        item.body = body
+        item.updatedAt = now
+      }
+      pruneTemp()
+      await saveTempStore()
+      await refresh()
+      return Response.json({ ok: true, id: targetId, items: tempStore.items, open: openTempCount() })
+    }
+
+    // 归档 is the action that removes an entry from the prompt; 删除 only touches
+    // the disk. Keeping them separate is what lets "完成后及时清理" be undone.
+    if (action === 'tempDone') {
+      const id = typeof payload?.id === 'string' ? payload.id : String(payload?.id ?? '')
+      const item = tempStore.items.find((entry) => entry.id === id)
+      if (item === undefined) {
+        return Response.json({ ok: false, error: `找不到临时记忆 #${id}` }, { status: 404 })
+      }
+      const done = payload?.done !== false
+      item.status = done ? 'done' : 'open'
+      item.updatedAt = new Date().toISOString()
+      if (done) item.doneAt = item.updatedAt
+      else delete item.doneAt
+      await saveTempStore()
+      await refresh()
+      return Response.json({
+        ok: true,
+        id,
+        status: item.status,
+        items: tempStore.items,
+        open: openTempCount(),
+      })
+    }
+
+    if (action === 'tempDelete') {
+      const id = typeof payload?.id === 'string' ? payload.id : String(payload?.id ?? '')
+      const index = tempStore.items.findIndex((entry) => entry.id === id)
+      if (index < 0) {
+        return Response.json({ ok: false, error: `找不到临时记忆 #${id}` }, { status: 404 })
+      }
+      tempStore.items.splice(index, 1)
+      await saveTempStore()
+      await refresh()
+      return Response.json({ ok: true, id, items: tempStore.items, open: openTempCount() })
+    }
+
+    if (action === 'tempCleanup') {
+      const before = tempStore.items.length
+      tempStore.items = tempStore.items.filter((item) => item.status !== 'done')
+      const removed = before - tempStore.items.length
+      await saveTempStore()
+      await refresh()
+      return Response.json({ ok: true, removed, items: tempStore.items, open: openTempCount() })
     }
 
     if (action === 'save') {

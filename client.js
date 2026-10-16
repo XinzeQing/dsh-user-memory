@@ -12,6 +12,9 @@ window.__ModuleLoader__.load({
     const PANEL_ORDER = 40;
     // A pseudo-tab: no file behind it, it shows the suggestion waiting area.
     const PENDING_KEY = '__pending__';
+    // The other pseudo-tab: the temporary working set. Same shape as the other
+    // keys on purpose — the panel's dirty/active logic keys off `file`.
+    const TEMP_KEY = '__temp__';
 
     // Chinese-first labels: the user should never have to read a filename.
     const FILES = [
@@ -22,9 +25,15 @@ window.__ModuleLoader__.load({
       { file: 'log.md', title: '变更日志', hint: '只给你自己记账，不注入' },
     ];
 
-    // Tabs = the editable files, plus the waiting area where I propose and only
-    // the user's click decides.
+    // Tabs = the editable files, plus the two pseudo-tabs: the temporary
+    // working set, and the waiting area where I propose and only the user's
+    // click decides.
     const TABS = FILES.concat([
+      {
+        file: TEMP_KEY,
+        title: '临时记忆',
+        hint: '跨对话交接、阶段目标、等待项。只在我要求时写入；标成完成后立刻从注入里消失（数据留在归档里，可恢复）',
+      },
       { file: PENDING_KEY, title: '待确认', hint: '我提议，你点「采纳」才会写进记忆；采纳后到我下一轮开跑之前可以撤销' },
     ]);
 
@@ -71,6 +80,15 @@ window.__ModuleLoader__.load({
       '.umem-switch{display:flex;align-items:flex-start;gap:10px;margin-top:10px;padding-top:10px;border-top:1px dashed var(--dsw-alias-border-l1);}',
       '.umem-switch .umem-btn{flex:none;}',
       '.umem-switch-note{font-size:12px;line-height:1.7;color:var(--dsw-alias-label-tertiary);}',
+      '.umem-form{flex:none;display:flex;flex-direction:column;gap:8px;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;padding:12px 14px;background:var(--dsw-alias-bg-layer-1);}',
+      '.umem-formrow{display:flex;align-items:center;gap:10px;flex-wrap:wrap;}',
+      '.umem-input,.umem-select{border:1px solid var(--dsw-alias-border-l1);border-radius:8px;padding:7px 10px;font-family:inherit;font-size:13px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);}',
+      '.umem-input:focus,.umem-select:focus,.umem-bigt:focus{outline:none;border-color:var(--dsw-alias-brand-primary);}',
+      '.umem-input:disabled,.umem-select:disabled,.umem-btn:disabled{opacity:.5;}',
+      '.umem-bigt{min-height:120px;resize:vertical;font-family:ui-monospace,Consolas,monospace;font-size:12.5px;line-height:1.65;}',
+      '.umem-badge{font-size:11px;padding:1px 8px;border-radius:9px;background:var(--dsw-alias-interactive-selected);color:var(--dsw-alias-label-secondary);}',
+      '.umem-card[data-muted="1"] .umem-text{opacity:.62;}',
+      '.umem-arch{margin:2px 0 0;font-size:12px;color:var(--dsw-alias-label-tertiary);}',
     ].join('\n');
 
     async function call(action, extra) {
@@ -124,6 +142,13 @@ window.__ModuleLoader__.load({
       // flashes a wrong state before the first response arrives.
       const [capture, setCapture] = useState(null);
       const [captureBusy, setCaptureBusy] = useState(false);
+      // 临时记忆（活跃工作集）。它不落任何 .md 文件，所以状态全在这里。
+      // `tempForm.id === ''` = 表单处于「新增」；否则是在编辑那一条。
+      const [temps, setTemps] = useState([]);
+      const [tempPath, setTempPath] = useState('');
+      const [tempEnabled, setTempEnabled] = useState(true);
+      const [tempForm, setTempForm] = useState({ id: '', kind: 'handoff', title: '', body: '' });
+      const [tempBusy, setTempBusy] = useState('');
 
       const load = useCallback(async () => {
         setStatus('loading');
@@ -177,23 +202,40 @@ window.__ModuleLoader__.load({
         }
       }, []);
 
+      // 临时记忆是宿主侧的 store，面板只是镜子：读、写、归档都过路由。
+      const loadTemp = useCallback(async () => {
+        try {
+          const data = await call('tempLoad');
+          if (data && data.ok === true) {
+            setTemps(Array.isArray(data.items) ? data.items : []);
+            setTempPath(typeof data.path === 'string' ? data.path : '');
+            setTempEnabled(data.enabled !== false);
+          }
+        } catch (error) {
+          /* keep whatever we already had */
+        }
+      }, []);
+
       useEffect(() => {
         void load();
         void loadSuggestions();
-      }, [load, loadSuggestions]);
+        void loadTemp();
+      }, [load, loadSuggestions, loadTemp]);
 
-      // While the waiting area is open, pick up a suggestion I make mid-turn.
+      // While either mirrored tab is open, pick up what changed outside the
+      // panel: a suggestion I make mid-turn, or a temp entry I write/archive.
       useEffect(
         function () {
-          if (active !== PENDING_KEY) return undefined;
+          if (active !== PENDING_KEY && active !== TEMP_KEY) return undefined;
           const handle = setInterval(function () {
-            void loadSuggestions();
+            if (active === PENDING_KEY) void loadSuggestions();
+            else void loadTemp();
           }, 5000);
           return function () {
             clearInterval(handle);
           };
         },
-        [active, loadSuggestions],
+        [active, loadSuggestions, loadTemp],
       );
 
       const dirty = FILES.some((entry) => (drafts[entry.file] || '') !== (saved[entry.file] || ''));
@@ -281,6 +323,78 @@ window.__ModuleLoader__.load({
         [loadSuggestions],
       );
 
+      // ---- 临时记忆面板动作 -------------------------------------------------
+      // 四个动作共用一套 busy 标记：连点时按钮是禁用的，不会重复提交。
+      const tempAction = useCallback(
+        async function (action, extra, okText) {
+          setTempBusy(action + ':' + (extra.id || ''));
+          setMessage(null);
+          try {
+            const data = await call(action, extra);
+            if (!data || data.ok !== true) throw new Error((data && data.error) || '操作失败');
+            setTemps(Array.isArray(data.items) ? data.items : []);
+            if (typeof okText === 'string' && okText !== '') setMessage({ kind: 'ok', text: okText });
+          } catch (error) {
+            setMessage({
+              kind: 'err',
+              text: '操作失败：' + String(error && error.message ? error.message : error),
+            });
+          } finally {
+            setTempBusy('');
+            await loadTemp();
+          }
+        },
+        [loadTemp],
+      );
+
+      const tempSubmit = useCallback(
+        async function () {
+          const editing = tempForm.id !== '';
+          if (tempForm.title.trim() === '' || tempForm.body.trim() === '') {
+            setMessage({ kind: 'err', text: '标题和正文都要填。' });
+            return;
+          }
+          setTempBusy('save');
+          setMessage(null);
+          try {
+            const data = await call('tempSave', {
+              id: tempForm.id,
+              kind: tempForm.kind,
+              title: tempForm.title,
+              body: tempForm.body,
+            });
+            if (!data || data.ok !== true) throw new Error((data && data.error) || '保存失败');
+            setTemps(Array.isArray(data.items) ? data.items : []);
+            setTempForm({ id: '', kind: tempForm.kind, title: '', body: '' });
+            setMessage({
+              kind: 'ok',
+              text: editing
+                ? '已更新 #' + tempForm.id + '，我下一步就能看到新内容。'
+                : '已新增 #' + data.id + '：我下一轮开始时就带着它。做完跟我说一声，或者回来点「标记完成」——它会立刻从注入里消失。',
+            });
+          } catch (error) {
+            setMessage({
+              kind: 'err',
+              text: '保存失败：' + String(error && error.message ? error.message : error),
+            });
+          } finally {
+            setTempBusy('');
+            await loadTemp();
+          }
+        },
+        [tempForm, loadTemp],
+      );
+
+      const tempEdit = useCallback(function (item) {
+        setTempForm({ id: item.id, kind: item.kind, title: item.title, body: item.body });
+        setMessage({ kind: 'ok', text: '正在编辑 #' + item.id + '：改完点「保存修改」才生效。' });
+      }, []);
+
+      const tempReset = useCallback(function () {
+        setTempForm({ id: '', kind: 'handoff', title: '', body: '' });
+        setMessage(null);
+      }, []);
+
       const style = h('style', { key: 'umem-style' }, CSS);
 
       if (status === 'loading') {
@@ -302,11 +416,15 @@ window.__ModuleLoader__.load({
       }
 
       const isPending = active === PENDING_KEY;
-      const current = isPending
-        ? TABS[TABS.length - 1]
+      const isTemp = active === TEMP_KEY;
+      // 两个伪标签页背后都没有文件：没有编辑器，也没有「未保存」可言。
+      const isPseudo = isPending || isTemp;
+      const current = isPseudo
+        ? TABS.find((entry) => entry.file === active) || TABS[TABS.length - 1]
         : FILES.find((entry) => entry.file === active) || FILES[0];
-      const isDirty = isPending ? false : (drafts[active] || '') !== (saved[active] || '');
+      const isDirty = isPseudo ? false : (drafts[active] || '') !== (saved[active] || '');
       const waiting = suggestions.filter((item) => item.status === 'pending').length;
+      const tempOpen = temps.filter((item) => item.status === 'open').length;
 
       // A memory file's Chinese name, for a suggestion's target.
       function targetTitle(file) {
@@ -451,6 +569,227 @@ window.__ModuleLoader__.load({
         );
       }
 
+      const KIND_LABEL = { handoff: '交接', stage: '阶段目标', waiting: '等待项' };
+      const KIND_NOTE = {
+        handoff: '交接：写给「另一个对话」的交付信息——目标、现状、下一步、关键路径、怎么算验收通过。',
+        stage: '阶段目标：我最近在替你做的事。写清楚，我就不用你每次重讲一遍。',
+        waiting: '等待项：等某个条件满足再执行的任务（通常就是本对话自己等）。',
+      };
+
+      // 时间戳直接截断显示：面板只用来认人，不需要精确到秒。
+      function shortTime(value) {
+        if (typeof value !== 'string' || value === '') return '（无时间）';
+        return value.replace('T', ' ').slice(0, 16);
+      }
+
+      function tempArea() {
+        if (!tempEnabled) {
+          return h(
+            'div',
+            { className: 'umem-center' },
+            h(
+              'div',
+              null,
+              '临时记忆没有启用。',
+              h(
+                'div',
+                { style: { marginTop: 10 } },
+                '它的开关在插件配置里：把 tempMemory 设为 true 并重载插件后，注入的「临时记忆」一节、temp_memory / temp_memory_done 两个工具，以及这个面板才会挂上。',
+              ),
+            ),
+          );
+        }
+        const open = temps.filter((item) => item.status === 'open');
+        const archived = temps.filter((item) => item.status === 'done').slice(-8).reverse();
+        const busy = tempBusy !== '';
+        const card = function (item) {
+          const isOpen = item.status === 'open';
+          const id = item.id;
+          return h(
+            'div',
+            {
+              key: id,
+              className: 'umem-card',
+              'data-open': isOpen ? '1' : '0',
+              'data-muted': isOpen ? '0' : '1',
+            },
+            h(
+              'div',
+              { className: 'umem-cardhead' },
+              h('span', { className: 'umem-id' }, '#' + id),
+              h('span', { className: 'umem-target' }, item.title),
+              h(
+                'span',
+                { className: 'umem-stage' },
+                (KIND_LABEL[item.kind] || item.kind) + (isOpen ? '' : ' · 已归档'),
+              ),
+            ),
+            h('pre', { className: 'umem-text' }, item.body),
+            item.note ? h('div', { className: 'umem-why' }, '结果：' + item.note) : null,
+            h(
+              'div',
+              { className: 'umem-why' },
+              (isOpen ? '创建于 ' : '归档于 ') +
+                shortTime(isOpen ? item.createdAt : item.doneAt || item.updatedAt),
+            ),
+            h(
+              'div',
+              { className: 'umem-cardfoot' },
+              h(
+                'button',
+                {
+                  className: 'umem-btn',
+                  disabled: busy,
+                  onClick: function () {
+                    // `done` is the target state, not a toggle: an open card
+                    // archives, an archived card goes back to open.
+                    void tempAction(
+                      'tempDone',
+                      { id: id, done: isOpen },
+                      isOpen
+                        ? '已归档 #' + id + '：它立刻从注入里消失，数据还在下面，随时能恢复。'
+                        : '已把 #' + id + ' 恢复为活跃：我下一轮又能看到它了。',
+                    );
+                  },
+                },
+                isOpen ? '标记完成' : '恢复为活跃',
+              ),
+              h(
+                'button',
+                { className: 'umem-btn', disabled: busy, onClick: function () { tempEdit(item); } },
+                '编辑',
+              ),
+              h(
+                'button',
+                {
+                  className: 'umem-btn',
+                  disabled: busy,
+                  onClick: function () {
+                    void tempAction('tempDelete', { id: id }, '已删除 #' + id + '（连归档一起）。');
+                  },
+                },
+                '删除',
+              ),
+              isOpen
+                ? h('span', { className: 'umem-msg' }, '「标记完成」= 从注入里拿掉；「删除」= 连存档一起删。')
+                : null,
+            ),
+          );
+        };
+        return h(
+          'div',
+          { className: 'umem-list' },
+          h(
+            'div',
+            { className: 'umem-form' },
+            h(
+              'div',
+              { className: 'umem-formrow' },
+              h(
+                'select',
+                {
+                  className: 'umem-select',
+                  disabled: busy,
+                  value: tempForm.kind,
+                  onChange: function (event) {
+                    const value = event.target.value;
+                    setTempForm((prev) => Object.assign({}, prev, { kind: value }));
+                  },
+                },
+                ['handoff', 'stage', 'waiting'].map((kind) =>
+                  h('option', { key: kind, value: kind }, KIND_LABEL[kind]),
+                ),
+              ),
+              h('input', {
+                className: 'umem-input',
+                style: { flex: 1, minWidth: 220 },
+                spellCheck: false,
+                disabled: busy,
+                placeholder: '一句话标题：这是什么、交给谁（等什么）',
+                value: tempForm.title,
+                onChange: function (event) {
+                  const value = event.target.value;
+                  setTempForm((prev) => Object.assign({}, prev, { title: value }));
+                },
+              }),
+              tempForm.id !== ''
+                ? h('span', { className: 'umem-badge' }, '编辑 #' + tempForm.id)
+                : null,
+            ),
+            h('textarea', {
+              className: 'umem-note umem-bigt',
+              spellCheck: false,
+              disabled: busy,
+              placeholder:
+                '正文（markdown）。交接条目请当成交付文档写：现在到哪一步、下一步做什么、关键路径、怎么算验收通过。',
+              value: tempForm.body,
+              onChange: function (event) {
+                const value = event.target.value;
+                setTempForm((prev) => Object.assign({}, prev, { body: value }));
+              },
+            }),
+            h(
+              'div',
+              { className: 'umem-formrow' },
+              h(
+                'button',
+                { className: 'umem-btn', disabled: busy, onClick: function () { void tempSubmit(); } },
+                tempBusy === 'save' ? '保存中…' : tempForm.id === '' ? '新增一条' : '保存修改',
+              ),
+              tempForm.id !== ''
+                ? h('button', { className: 'umem-btn', disabled: busy, onClick: tempReset }, '取消编辑')
+                : null,
+              h('span', { className: 'umem-msg' }, KIND_NOTE[tempForm.kind] || ''),
+            ),
+            h(
+              'div',
+              { className: 'umem-arch' },
+              '存储位置：' + (tempPath || '（未知）') + '　|　当前活跃 ' + tempOpen + ' 条',
+            ),
+          ),
+          open.length === 0 && archived.length === 0
+            ? h(
+                'div',
+                { className: 'umem-center' },
+                h(
+                  'div',
+                  null,
+                  '临时记忆是空的。',
+                  h(
+                    'div',
+                    { style: { marginTop: 10 } },
+                    '这里放的是「还没做完的事」：跨对话的交接、阶段目标、等待项。它不会自动增长——我只有在明确要求时才写。',
+                  ),
+                ),
+              )
+            : null,
+          open.map(card),
+          archived.length > 0
+            ? h(
+                'div',
+                { className: 'umem-formrow' },
+                h(
+                  'span',
+                  { className: 'umem-msg', style: { flex: 1 } },
+                  '归档 ' + archived.length + ' 条（不再注入）',
+                ),
+                h(
+                  'button',
+                  {
+                    className: 'umem-btn',
+                    disabled: busy,
+                    onClick: function () {
+                      void tempAction('tempCleanup', {}, '已清理全部已归档条目。');
+                    },
+                  },
+                  '清空归档',
+                ),
+              )
+            : null,
+          archived.map(card),
+        );
+      }
+
       return h(
         'div',
         { className: 'umem-root' },
@@ -492,10 +831,12 @@ window.__ModuleLoader__.load({
           'div',
           { className: 'umem-tabs' },
           TABS.map(function (entry) {
-            const entryDirty =
-              entry.file === PENDING_KEY
-                ? false
-                : (drafts[entry.file] || '') !== (saved[entry.file] || '');
+            const pseudo = entry.file === PENDING_KEY || entry.file === TEMP_KEY;
+            const entryDirty = pseudo
+              ? false
+              : (drafts[entry.file] || '') !== (saved[entry.file] || '');
+            const badge =
+              entry.file === PENDING_KEY ? waiting : entry.file === TEMP_KEY ? tempOpen : 0;
             return h(
               'button',
               {
@@ -506,27 +847,28 @@ window.__ModuleLoader__.load({
                   setActive(entry.file);
                   setMessage(null);
                   if (entry.file === PENDING_KEY) void loadSuggestions();
+                  if (entry.file === TEMP_KEY) void loadTemp();
                 },
               },
               entry.title,
               entryDirty ? h('span', { className: 'umem-dot' }) : null,
-              entry.file === PENDING_KEY && waiting > 0
-                ? h('span', { className: 'umem-count' }, waiting)
-                : null,
+              badge > 0 ? h('span', { className: 'umem-count' }, badge) : null,
             );
           }),
         ),
         h(
           'div',
           { className: 'umem-hintbar' },
-          current.hint + (isPending ? '' : '　|　' + current.file),
+          current.hint + (isPseudo ? '' : '　|　' + current.file),
         ),
         h(
           'div',
-          { className: 'umem-body', 'data-flat': isPending ? '1' : '0' },
+          { className: 'umem-body', 'data-flat': isPseudo ? '1' : '0' },
           isPending
             ? waitingArea()
-            : h('textarea', {
+            : isTemp
+              ? tempArea()
+              : h('textarea', {
                 className: 'umem-editor',
                 spellCheck: false,
                 value: drafts[active] || '',
@@ -543,13 +885,14 @@ window.__ModuleLoader__.load({
         h(
           'div',
           { className: 'umem-foot' },
-          isPending
+          isPseudo
             ? h(
                 'button',
                 {
                   className: 'umem-btn',
                   onClick: function () {
-                    void loadSuggestions();
+                    if (isTemp) void loadTemp();
+                    else void loadSuggestions();
                   },
                 },
                 '刷新',
@@ -565,7 +908,7 @@ window.__ModuleLoader__.load({
                 },
                 saving ? '保存中…' : isDirty ? '保存这一节' : '没有改动',
               ),
-          isPending
+          isPseudo
             ? null
             : h(
                 'button',
@@ -586,7 +929,9 @@ window.__ModuleLoader__.load({
               ? message.text
               : isPending
                 ? '「采纳」只是通知我下一轮来写；左下角补充框里的字，也是点「采纳」那一刻才存下来。采纳后到我下一轮开跑之前，可以「撤销采纳」。'
-                : '保存后立即生效，无需重启。注释 <!-- --> 不会注入给我。',
+                : isTemp
+                  ? '临时记忆有自己的预算（默认 1200 字符），不吃长期记忆的额度。只在我被明确要求时才新增；标成完成的条目立刻从注入里消失——「完成即清理」，数据留在这里可恢复。'
+                  : '保存后立即生效，无需重启。注释 <!-- --> 不会注入给我。',
           ),
         ),
       );

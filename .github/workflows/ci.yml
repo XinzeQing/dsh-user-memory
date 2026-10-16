@@ -77,6 +77,11 @@ jobs:
       - name: Self-test - tool registration and schema
         run: node test/suggest-test.mjs
 
+      # Host side: the temporary working set — second prompt section, the two
+      # temp tools, the five temp routes and the archive/done lifecycle.
+      - name: Self-test - temporary memory
+        run: node test/temp-test.mjs
+
       # Browser side: renders the real panel (jsdom + React). Those two are
       # intentionally not dependencies of this plugin, so the test skips here
       # and runs locally with UMEM_UI_DEPS pointing at a node_modules that has
