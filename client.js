@@ -18,11 +18,11 @@ window.__ModuleLoader__.load({
 
     // Chinese-first labels: the user should never have to read a filename.
     const FILES = [
-      { file: 'rules-must.md', title: '必须遵守', hint: '硬性要求，我会按字面执行' },
-      { file: 'agent.md', title: '行为设定', hint: '我面对你时的做事方式' },
-      { file: 'profile.md', title: '用户画像', hint: '关于你的背景，用来调整我的表达' },
+      { file: 'rules-must.md', title: '必须遵守', hint: '硬性要求，AI 按字面执行' },
+      { file: 'agent.md', title: '行为设定', hint: 'AI 面对用户时的做事方式' },
+      { file: 'profile.md', title: '用户画像', hint: '关于用户的背景，用来调整 AI 的表达' },
       { file: 'rules-should.md', title: '可选遵守', hint: '酌情执行，优先级低于上面' },
-      { file: 'log.md', title: '变更日志', hint: '只给你自己记账，不注入' },
+      { file: 'log.md', title: '变更日志', hint: '只给用户自己记账，不注入' },
     ];
 
     // Tabs = the editable files, plus the two pseudo-tabs: the temporary
@@ -32,9 +32,9 @@ window.__ModuleLoader__.load({
       {
         file: TEMP_KEY,
         title: '临时记忆',
-        hint: '跨对话交接、阶段目标、等待项。只在我要求时写入；标成完成后立刻从注入里消失（数据留在归档里，可恢复）',
+        hint: '跨对话交接、阶段目标、等待项。只在用户要求时写入；标成完成后立刻从注入里消失（数据留在归档里，可恢复）',
       },
-      { file: PENDING_KEY, title: '待确认', hint: '我提议，你点「采纳」才会写进记忆；采纳后到我下一轮开跑之前可以撤销' },
+      { file: PENDING_KEY, title: '待确认', hint: 'AI 提议，用户点「采纳」才会写进记忆；采纳后到 AI 下一轮开跑之前可以撤销' },
     ]);
 
     const CSS = [
@@ -253,8 +253,8 @@ window.__ModuleLoader__.load({
             kind: 'ok',
             text:
               next
-                ? '记忆采集已开启：我从下一轮对话起会主动提议值得长期记住的偏好（仍然只进「待确认」，要你点「采纳」才写）。'
-                : '记忆采集已关闭：我不再主动提议，系统提示词回到逐字节和以前一样。',
+                ? '记忆采集已开启：AI 从下一轮对话起会主动提议值得长期记住的偏好（仍然只进「待确认」，要用户点「采纳」才写）。'
+                : '记忆采集已关闭：AI 不再主动提议，系统提示词回到逐字节和以前一样。',
           });
         } catch (error) {
           setMessage({ kind: 'err', text: '设置失败：' + String(error && error.message ? error.message : error) });
@@ -301,11 +301,11 @@ window.__ModuleLoader__.load({
               kind: 'ok',
               text:
                 decision === 'accept'
-                  ? '已采纳 #' + id + '。我下一轮会收到通知，然后把它总结进记忆。' +
-                    (wrote ? '你写的补充会一起交给我（和原文冲突时以补充为准）。' : '') +
-                    '在我下一轮开跑之前，这里随时可以撤销。'
+                  ? '已采纳 #' + id + '。AI 下一轮会收到通知，然后把它总结进记忆。' +
+                    (wrote ? '用户写的补充会一起交给 AI（和原文冲突时以补充为准）。' : '') +
+                    '在 AI 下一轮开跑之前，这里随时可以撤销。'
                   : decision === 'revoke'
-                    ? '已撤销 #' + id + '。它回到「等你决定」：可以改补充，也可以重新采纳。'
+                    ? '已撤销 #' + id + '。它回到「待用户决定」：可以改补充，也可以重新采纳。'
                     : '已忽略 #' + id + '，它不会被写入。',
             });
           } catch (error) {
@@ -315,7 +315,7 @@ window.__ModuleLoader__.load({
             });
           } finally {
             setBusyId('');
-            // 成功失败都刷新：撤销正好撞上「我下一轮已开始」时，面板必须立刻
+            // 成功失败都刷新：撤销正好撞上「AI 下一轮已开始」时，面板必须立刻
             // 显示真实状态，而不是让用户以为撤销成功了。
             await loadSuggestions();
           }
@@ -369,8 +369,8 @@ window.__ModuleLoader__.load({
             setMessage({
               kind: 'ok',
               text: editing
-                ? '已更新 #' + tempForm.id + '，我下一步就能看到新内容。'
-                : '已新增 #' + data.id + '：我下一轮开始时就带着它。做完跟我说一声，或者回来点「标记完成」——它会立刻从注入里消失。',
+                ? '已更新 #' + tempForm.id + '，AI 下一步就能看到新内容。'
+                : '已新增 #' + data.id + '：AI 下一轮开始时就带着它。做完跟 AI 说一声，或者回来点「标记完成」——它会立刻从注入里消失。',
             });
           } catch (error) {
             setMessage({
@@ -433,8 +433,8 @@ window.__ModuleLoader__.load({
       }
 
       const STAGE = {
-        pending: '等你决定',
-        accepted: '已采纳 · 可撤销，等我下一轮写入',
+        pending: '待用户决定',
+        accepted: '已采纳 · 可撤销，等 AI 下一轮写入',
         delivered: '通知已送达 · 处理中',
         done: '已完成',
         dismissed: '已忽略',
@@ -457,7 +457,7 @@ window.__ModuleLoader__.load({
               h(
                 'div',
                 { style: { marginTop: 10 } },
-                '我只有在提议时才会往这里放东西——放进来也不会自动写入，必须你点「采纳」。',
+                'AI 只有在提议时才会往这里放东西——放进来也不会自动写入，必须用户点「采纳」。',
               ),
             ),
           );
@@ -483,7 +483,7 @@ window.__ModuleLoader__.load({
               h('pre', { className: 'umem-text' }, item.text),
               item.why ? h('div', { className: 'umem-why' }, '理由：' + item.why) : null,
               item.note ? h('div', { className: 'umem-why' }, '结果：' + item.note) : null,
-              // 补充框只给「等你决定」的卡片：落盘只发生在点「采纳」那一刻。
+              // 补充框只给「待用户决定」的卡片：落盘只发生在点「采纳」那一刻。
               isOpen
                 ? h('textarea', {
                     className: 'umem-note',
@@ -491,7 +491,7 @@ window.__ModuleLoader__.load({
                     spellCheck: false,
                     disabled: busyId !== '',
                     placeholder:
-                      '补充说明（可选）：你想额外加的要求。点「采纳」时它和我提议的原文一起交给我，冲突时以你的补充为准。',
+                      '补充说明（可选）：用户想额外加的要求。点「采纳」时它和 AI 提议的原文一起交给 AI，冲突时以用户填写的补充为准。',
                     value: notes[item.id] || '',
                     onChange: function (event) {
                       const value = event.target.value;
@@ -503,7 +503,7 @@ window.__ModuleLoader__.load({
                     },
                   })
                 : recorded !== ''
-                  ? h('div', { className: 'umem-note-ro' }, '你的补充：' + recorded)
+                  ? h('div', { className: 'umem-note-ro' }, '用户的补充：' + recorded)
                   : null,
               isOpen
                 ? h(
@@ -550,7 +550,7 @@ window.__ModuleLoader__.load({
                       h(
                         'span',
                         { className: 'umem-msg' },
-                        '已采纳，还没交到我下一轮。撤销后它回到「等你决定」，可以改完补充再采纳。',
+                        '已采纳，还没交给 AI 下一轮。撤销后它回到「待用户决定」，可以改完补充再采纳。',
                       ),
                     )
                   : isDelivered
@@ -560,7 +560,7 @@ window.__ModuleLoader__.load({
                         h(
                           'span',
                           { className: 'umem-msg' },
-                          '这条已经交到我下一轮了，撤销来不及；要改就在对话里直接跟我说。',
+                          '这条已经交给 AI 下一轮了，撤销来不及；要改就在对话里直接跟 AI 说。',
                         ),
                       )
                     : null,
@@ -572,7 +572,7 @@ window.__ModuleLoader__.load({
       const KIND_LABEL = { handoff: '交接', stage: '阶段目标', waiting: '等待项' };
       const KIND_NOTE = {
         handoff: '交接：写给「另一个对话」的交付信息——目标、现状、下一步、关键路径、怎么算验收通过。',
-        stage: '阶段目标：我最近在替你做的事。写清楚，我就不用你每次重讲一遍。',
+        stage: '阶段目标：AI 最近在替用户做的事。写清楚，AI 就不用每次重讲一遍。',
         waiting: '等待项：等某个条件满足再执行的任务（通常就是本对话自己等）。',
       };
 
@@ -648,7 +648,7 @@ window.__ModuleLoader__.load({
                       { id: id, done: isOpen },
                       isOpen
                         ? '已归档 #' + id + '：它立刻从注入里消失，数据还在下面，随时能恢复。'
-                        : '已把 #' + id + ' 恢复为活跃：我下一轮又能看到它了。',
+                        : '已把 #' + id + ' 恢复为活跃：AI 下一轮又能看到它了。',
                     );
                   },
                 },
@@ -758,7 +758,7 @@ window.__ModuleLoader__.load({
                   h(
                     'div',
                     { style: { marginTop: 10 } },
-                    '这里放的是「还没做完的事」：跨对话的交接、阶段目标、等待项。它不会自动增长——我只有在明确要求时才写。',
+                    '这里放的是「还没做完的事」：跨对话的交接、阶段目标、等待项。它不会自动增长——AI 只在被明确要求时才写。',
                   ),
                 ),
               )
@@ -823,7 +823,7 @@ window.__ModuleLoader__.load({
               { className: 'umem-switch-note' },
               capture && capture.source === 'config'
                 ? '当前状态来自插件配置（配置文件里写了 autoCapture），点一下就用面板的设置覆盖它。'
-                : '开启后，我会在对话里主动提议值得长期记住的偏好——提议只进「待确认」，你点「采纳」才会写进记忆。',
+                : '开启后，AI 会在对话里主动提议值得长期记住的偏好——提议只进「待确认」，用户点「采纳」才会写进记忆。',
             ),
           ),
         ),
@@ -928,10 +928,10 @@ window.__ModuleLoader__.load({
             message
               ? message.text
               : isPending
-                ? '「采纳」只是通知我下一轮来写；左下角补充框里的字，也是点「采纳」那一刻才存下来。采纳后到我下一轮开跑之前，可以「撤销采纳」。'
+                ? '「采纳」只是通知 AI 下一轮来写；左下角补充框里的字，也是点「采纳」那一刻才存下来。采纳后到 AI 下一轮开跑之前，可以「撤销采纳」。'
                 : isTemp
-                  ? '临时记忆有自己的预算（默认 1200 字符），不吃长期记忆的额度。只在我被明确要求时才新增；标成完成的条目立刻从注入里消失——「完成即清理」，数据留在这里可恢复。'
-                  : '保存后立即生效，无需重启。注释 <!-- --> 不会注入给我。',
+                  ? '临时记忆有自己的预算（默认 1200 字符），不吃长期记忆的额度。只在被明确要求时才新增；标成完成的条目立刻从注入里消失——「完成即清理」，数据留在这里可恢复。'
+                  : '保存后立即生效，无需重启。注释 <!-- --> 不会注入给 AI。',
           ),
         ),
       );

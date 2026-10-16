@@ -65,7 +65,7 @@ check('section name', a.box.captured.name === 'user-memory')
 check('section order', a.box.captured.order === -500)
 check('text is provider fn', typeof a.box.captured.text === 'function')
 check('scaffold made 5 files', (await readdir(dir1)).length === 5, (await readdir(dir1)).sort().join(','))
-check('fresh: injects the seeded hard rule', fresh.includes('只有我明确说'))
+check('fresh: injects the seeded hard rule', fresh.includes('只有用户明确说'))
 check('fresh: heading-only files are NOT injected', !fresh.includes('### 我的行为设定') && !fresh.includes('### 用户画像') && !fresh.includes('### 可选遵守'))
 check('fresh: no HTML comment leaks into prompt', !fresh.includes('<!--'))
 

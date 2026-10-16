@@ -249,7 +249,7 @@ const box = container.querySelector('.umem-note')
 check('panel: pending card shows a 补充 textarea', box !== null && box.tagName === 'TEXTAREA')
 check(
   'panel: the box explains itself and starts empty',
-  box.placeholder.includes('补充说明') && box.placeholder.includes('以你的补充为准') && box.value === '',
+  box.placeholder.includes('补充说明') && box.placeholder.includes('以用户填写的补充为准') && box.value === '',
 )
 check('panel: no read-only note line while nothing is written', container.querySelector('.umem-note-ro') === null)
 
@@ -283,7 +283,7 @@ check('panel: an accepted card no longer offers an input box', container.querySe
 const ro = container.querySelector('.umem-note-ro')
 check(
   'panel: the recorded supplement is shown read-only',
-  ro !== null && ro.textContent.includes('你的补充：') && ro.textContent.includes('就一句话，别用术语'),
+  ro !== null && ro.textContent.includes('用户的补充：') && ro.textContent.includes('就一句话，别用术语'),
   ro ? ro.textContent : 'MISSING',
 )
 check('panel: the accepted card offers 撤销采纳', buttonByText('撤销采纳') !== undefined)
@@ -327,7 +327,7 @@ items = [
 ]
 await poll()
 check('panel: a delivered card has no 撤销采纳 button', buttonByText('撤销采纳') === undefined)
-check('panel: the delivered card explains why it cannot be revoked', text().includes('已经交到我下一轮了'))
+check('panel: the delivered card explains why it cannot be revoked', text().includes('已经交给 AI 下一轮了'))
 
 // ---------- 8. the auto-capture switch ----------
 // The switch must be usable the moment the panel opens, and must never show a
@@ -381,7 +381,7 @@ check(
 )
 
 await click(buttonByText('临时记忆'))
-check('panel: an empty store says so, and says why it stays empty', text().includes('临时记忆是空的') && text().includes('只有在明确要求时才写'))
+check('panel: an empty store says so, and says why it stays empty', text().includes('临时记忆是空的') && text().includes('只在被明确要求时才写'))
 check('panel: the form offers all three kinds', container.querySelectorAll('.umem-select option').length === 3)
 const titleBox = container.querySelector('.umem-input')
 const bodyBox = container.querySelector('.umem-bigt')

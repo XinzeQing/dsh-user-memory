@@ -130,7 +130,7 @@ const TEMP_NOTE_RESERVE = 120
 /** Injected order: behaviour-shaping first, descriptive later, soft last. */
 const SECTIONS = [
   { file: 'rules-must.md', title: '必须遵守（硬性要求）' },
-  { file: 'agent.md', title: '我的行为设定' },
+  { file: 'agent.md', title: '行为设定' },
   { file: 'profile.md', title: '用户画像' },
   { file: 'rules-should.md', title: '可选遵守（酌情）' },
 ]
@@ -138,8 +138,8 @@ const SECTIONS = [
 const PREAMBLE = [
   '## 用户长期记忆',
   '',
-  '以下内容由用户本人编写和维护，是用户对我提出的明确要求，不是参考资料。',
-  '「必须遵守」与「我的行为设定」两节按字面执行；「可选遵守」酌情执行，冲突时以前者为准。',
+  '以下内容由用户本人编写和维护，是用户对 AI 提出的明确要求，不是参考资料。',
+  '「必须遵守」与「行为设定」两节按字面执行；「可选遵守」酌情执行，冲突时以前者为准。',
   '这份记忆只在用户明确要求时才会被修改。',
 ].join('\n')
 
@@ -157,21 +157,21 @@ const TEMPLATES = {
     '  本文件为空（或只剩注释）时，不会有任何硬性要求被注入。',
     '-->',
     '',
-    '- 只有我明确说“做”或“可以”，你才动手；我没说的不要自己开工，也不要顺手改动别的文件。',
+    '- 只有用户明确说“做”或“可以”，才动手；用户没说的不要自己开工，也不要顺手改动别的文件。',
     '',
   ].join('\n'),
 
   'agent.md': [
-    '# 我的行为设定',
+    '# 行为设定',
     '',
     '<!--',
-    '  这一节决定我面对你时的“行为模式”。目前尚未设定，下面是可选模式，你选定后我写进来：',
+    '  这一节决定 AI 面对用户时的“行为模式”。目前尚未设定，下面是可选模式，用户选定后写进来：',
     '    - 直接干活：收到需求就动手，做完再汇报，不解释过程。',
-    '    - 先回复再干：先用一句话说明我的判断和打算，再执行。',
+    '    - 先回复再干：先用一句话说明判断和打算，再执行。',
     '    - 只解答不动手：只给答案和方案，绝不碰文件和命令。',
     '    - 先问清再干：需求有歧义时先问，问清楚再动手。',
-    '    - 先给方案等我挑：列出选项让你选，你选完我才执行。',
-    '  也可以写得更细，例如“提问时必须给出你认为最优的一项并说明理由”。',
+    '    - 先给方案等用户挑：列出选项让用户选，选完才执行。',
+    '  也可以写得更细，例如“提问时必须给出自己认为最优的一项并说明理由”。',
     '  本文件为空（或只剩注释）时，不会有任何行为设定被注入。',
     '-->',
     '',
@@ -181,8 +181,8 @@ const TEMPLATES = {
     '# 用户画像',
     '',
     '<!--',
-    '  这里写你自己：你是谁、你的习惯、你在意什么、你讨厌什么。',
-    '  我会把它当作背景来调整用词、详略和举例方式，但它不构成命令。',
+    '  这里写用户本人：是谁、有哪些习惯、在意什么、讨厌什么。',
+    '  AI 会把它当作背景来调整用词、详略和举例方式，但它不构成命令。',
     '  本文件为空（或只剩注释）时不会被注入。',
     '-->',
     '',
@@ -192,7 +192,7 @@ const TEMPLATES = {
     '# 可选遵守（酌情）',
     '',
     '<!--',
-    '  这里写“最好这样，但要看情况”的偏好，与「必须遵守」分开，便于你自行判断优先级。',
+    '  这里写“最好这样，但要看情况”的偏好，与「必须遵守」分开，便于用户自行判断优先级。',
     '  一条一行，以 "- " 开头。本文件为空（或只剩注释）时不会被注入。',
     '-->',
     '',
@@ -226,7 +226,7 @@ function meaningful(body) {
  */
 function describeInjection(file, content) {
   const spec = SECTIONS.find((entry) => entry.file === file)
-  if (spec === undefined) return '这个文件不注入（只作为你自己的记录）。'
+  if (spec === undefined) return '这个文件不注入（只作为用户自己的记录）。'
   const body = meaningful(stripComments(content))
   if (body === '') return '目前这一节是空的（只剩标题或注释），不会注入。'
   return `已生效：这一节会注入（约 ${[...body].length} 字）。`
@@ -481,7 +481,7 @@ export async function apply(ctx, config = {}) {
     ctx.logger?.warn?.(`user-memory: could not prepare ${dir}: ${String(error)}`)
   }
 
-  // ---- 待确认区：我提议，用户点「采纳」才写 ------------------------------------
+  // ---- 待确认区：AI 提议，用户点「采纳」才写 ------------------------------------
   //
   // The only path from a suggestion to a memory file is the user's own click in
   // the panel. The agent may PROPOSE (memory_suggest) and REPORT
@@ -743,8 +743,8 @@ export async function apply(ctx, config = {}) {
     name: 'temp_memory',
     description:
       '把一条「临时记忆」写进跨对话的活跃工作集（会自动注入到之后的每一步上下文里）。**只在用户明确要求时调用**：' +
-      '他说「写临时记忆 / 记到临时记忆 / 交付记忆 / 换会话执行 / 下次对话接着做」，或让你把某件事记下来交给别的对话。' +
-      '除此之外一律不要调用——不要在你觉得有用时写，不要自动总结，不要顺手记，否则会吃满他的上下文预算。' +
+      '用户说「写临时记忆 / 记到临时记忆 / 交付记忆 / 换会话执行 / 下次对话接着做」，或让你把某件事记下来交给别的对话。' +
+      '除此之外一律不要调用——不要在你觉得有用时写，不要自动总结，不要顺手记，否则会吃满用户的上下文预算。' +
       'kind：handoff=交接（给另一个对话的交付信息）、stage=阶段目标（眼下在做的事，减少重复说明）、' +
       'waiting=等待项（等条件满足再执行）。交接条目同时是交付文档，正文可以写长、写全。',
     parameters: toolSchema({
@@ -1055,12 +1055,12 @@ export async function apply(ctx, config = {}) {
       // 送达撞车（先送达、后撤销）都不会把状态写坏：撞车时这里如实拒绝。
       if (choice === 'revoke') {
         if (item.status === 'pending') {
-          return Response.json({ ok: false, error: '这条还在等你决定，不需要撤销。' }, { status: 409 })
+          return Response.json({ ok: false, error: '这条还在等用户决定，不需要撤销。' }, { status: 409 })
         }
         if (item.status !== 'accepted') {
           const reason =
             item.status === 'delivered'
-              ? '这条已经交到下一轮了（我已经收到），无法撤销；可以在对话里直接让我别写。'
+              ? '这条已经交到下一轮了（AI 已经收到），无法撤销；可以在对话里直接让 AI 别写。'
               : '这条已经处理完了，无法撤销。'
           return Response.json({ ok: false, error: reason, status: item.status }, { status: 409 })
         }

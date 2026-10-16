@@ -1,6 +1,6 @@
 {
   "name": "dsh-user-memory",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "User-authored tiered long-term memory for DeepSeek Harness: must/should rules, user profile, and agent behavior setting, injected as a system-prompt section, plus a temporary working set (cross-session handoffs, stage goals, waiting items) that leaves the prompt as soon as it is finished. Chinese graphical panel for viewing and editing both. Writes only ever happen when the user asks or saves.",
   "license": "MIT",
   "repository": {
