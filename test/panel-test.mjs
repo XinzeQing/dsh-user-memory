@@ -89,7 +89,7 @@ const tempOpen = () => tempStore.items.filter((i) => i.status === 'open').length
 const tempReply = () => ({
   ok: true,
   enabled: true,
-  path: 'C:\\Users\\Adler\\.dsh\\temp-memory.json',
+  path: 'C:\\Users\\example\\.dsh\\temp-memory.json',
   // Fresh objects per response, like the real route: the panel is handed a new
   // array every time, so React cannot bail out on an identical reference.
   items: tempStore.items.map((item) => Object.assign({}, item)),
@@ -101,7 +101,7 @@ function route(payload) {
   if (payload.action === 'load') {
     return {
       ok: true,
-      dir: 'C:\\Users\\Adler\\.dsh\\memory',
+      dir: 'C:\\Users\\example\\.dsh\\memory',
       files: FILES.map((file) => ({ file, content: '' })),
       autoCapture: capture,
     }

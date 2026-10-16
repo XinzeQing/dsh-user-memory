@@ -24,6 +24,22 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
 
+      # A public repo must not carry one machine's absolute paths: nobody else
+      # can reproduce them, and they leak the author's own layout. Placeholders
+      # (`<DSH_HOME>`, `C:\Users\example\...`) are the accepted style.
+      - name: Assert no machine-specific paths
+        shell: bash
+        run: |
+          hits=$(git grep -n -I -E 'C:[\\/]+Users[\\/]+[A-Za-z0-9._-]+|/home/[a-z0-9._-]+/|/Users/[A-Za-z0-9._-]+/' \
+            -- . ':!screenshots' ':!screenshots.json' \
+            | grep -v -E 'Users[\\/]+(example|you|user|username)[\\/]' || true)
+          if [ -n "$hits" ]; then
+            echo "$hits"
+            echo "::error::上面的文件里写死了某台机器的绝对路径，请改用 <DSH_HOME> 之类的占位符"
+            exit 1
+          fi
+          echo 'no machine-specific paths'
+
       # This plugin has no dependencies and no build step, so there is
       # deliberately no `npm install` / `npm ci` here. Asserting that keeps
       # the "zero dependency, nothing to build" claim honest.

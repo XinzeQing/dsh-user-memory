@@ -6,9 +6,22 @@
 // and check that promise from both ends: the tool can only propose, and only
 // the panel route can decide.
 import { mkdtemp, readFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { apply } from '../index.js'
+
+// Where DSH keeps its own packages. Read here, before the test below points
+// DSH_HOME at a throwaway directory; overridable, because an install can live
+// anywhere (UMEM_DSH_TOOLS wins, then the DSH_HOME the user actually runs with,
+// then the default ~/.dsh).
+const DSH_TOOLS_ENTRY = [
+  process.env.UMEM_DSH_TOOLS,
+  ...(process.env.DSH_HOME === undefined
+    ? []
+    : [join(process.env.DSH_HOME, 'profiles', 'node_modules', '@deepseek-ai', 'dsh-tools', 'lib', 'index.js')]),
+  join(homedir(), '.dsh', 'profiles', 'node_modules', '@deepseek-ai', 'dsh-tools', 'lib', 'index.js'),
+].find((candidate) => typeof candidate === 'string' && candidate !== '')
 
 let failures = 0
 function check(label, ok, extra = '') {
@@ -120,19 +133,22 @@ check(
 )
 // The registry validator itself, when the local dsh install is reachable: this
 // is the exact call that used to throw and abort apply() before the tools were
-// registered — and before the prompt section was.
+// registered — and before the prompt section was. dsh-tools ships inside the
+// DSH install, so its path is discovered (see DSH_TOOLS_ENTRY) instead of
+// hardcoded; when it is not there, this one check skips.
 try {
-  const { assertSupportedJsonSchema } = await import(
-    'file:///C:/Users/Adler/.dsh/profiles/node_modules/@deepseek-ai/dsh-tools/lib/index.js'
-  )
+  const { assertSupportedJsonSchema } = await import(pathToFileURL(DSH_TOOLS_ENTRY).href)
   for (const t of [suggest, done]) {
     assertSupportedJsonSchema(t.parameters)
     assertSupportedJsonSchema(t.output.schema)
   }
   check('tools: the real registry validator accepts both schemas', true)
 } catch (error) {
-  if (error?.code === 'ERR_MODULE_NOT_FOUND') console.log('SKIP  tools: dsh-tools not reachable')
-  else check('tools: the real registry validator accepts both schemas', false, String(error?.message ?? error))
+  if (error?.code === 'ERR_MODULE_NOT_FOUND') {
+    console.log('SKIP  tools: dsh-tools not reachable (set UMEM_DSH_TOOLS to <dsh>/profiles/node_modules/@deepseek-ai/dsh-tools/lib/index.js)')
+  } else {
+    check('tools: the real registry validator accepts both schemas', false, String(error?.message ?? error))
+  }
 }
 check(
   'tools: output renders a text block',
