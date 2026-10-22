@@ -39,7 +39,13 @@ function check(label, ok, extra = '') {
   if (!ok) failures += 1
 }
 
-const dom = new JSDOM('<!doctype html><html><body></body></html>', { pretendToBeVisual: true })
+// `url` gives the document a real origin: without one `window.localStorage`
+// throws (opaque origin), and the panel's remember-the-tab path would silently
+// fall back to the default instead of being exercised.
+const dom = new JSDOM('<!doctype html><html><body></body></html>', {
+  pretendToBeVisual: true,
+  url: 'http://localhost/',
+})
 const w = dom.window
 globalThis.window = w
 globalThis.document = w.document
@@ -198,7 +204,7 @@ check('client: registers both the main panel and the sidebar entry', Boolean(pan
 const Panel = panelEntry.comp
 const container = document.createElement('div')
 document.body.appendChild(container)
-const root = createRoot(container)
+let root = createRoot(container)
 
 const flush = async (fn) => {
   await act(async () => {
@@ -243,8 +249,22 @@ const text = () => container.textContent || ''
 items = [{ id: '7', file: 'rules-must.md', text: '回答短一点。', why: '用户说了三次', status: 'pending' }]
 await flush(() => { root.render(React.createElement(Panel)) })
 
+// The panel must not open on 必须遵守 just because it is the first file: the
+// working set is what the user opens it for. (localStorage is empty here, so
+// this is the first-visit default.)
+check(
+  'panel: opens on 临时记忆, not on the first file',
+  text().includes('跨对话交接、阶段目标、等待项') && text().includes('临时记忆'),
+  (container.querySelector('.umem-hintbar') || {}).textContent || 'MISSING',
+)
+
 // ---------- 1. the waiting area opens with a supplement box ----------
 await click(buttonByText('待确认'))
+check(
+  'panel: the chosen tab is remembered for the next open',
+  w.localStorage.getItem('dsh-user-memory:active-tab') === '__pending__',
+  String(w.localStorage.getItem('dsh-user-memory:active-tab')),
+)
 const box = container.querySelector('.umem-note')
 check('panel: pending card shows a 补充 textarea', box !== null && box.tagName === 'TEXTAREA')
 check(
@@ -465,6 +485,28 @@ check(
   'panel: 删除 sends tempDelete and says the archive goes with it',
   sent.some((p) => p.action === 'tempDelete' && p.id === '9') && text().includes('连归档一起'),
 )
+
+// ---------- reopen: the last tab survives a re-mount ----------
+// The panel is closed and opened again constantly; coming back to 必须遵守 every
+// time is what the 临时记忆 default exists to fix. Clicking a plain file tab
+// must be remembered too, not only the pseudo-tabs.
+await click(buttonByText('必须遵守'))
+check(
+  'panel: a plain file tab is remembered as well',
+  w.localStorage.getItem('dsh-user-memory:active-tab') === 'rules-must.md',
+  String(w.localStorage.getItem('dsh-user-memory:active-tab')),
+)
+await flush(() => { root.unmount() })
+container.innerHTML = ''
+w.localStorage.setItem('dsh-user-memory:active-tab', 'agent.md')
+root = createRoot(container)
+await flush(() => { root.render(React.createElement(Panel)) })
+check(
+  'panel: a reopened panel restores the remembered tab',
+  ((container.querySelector('.umem-hintbar') || {}).textContent || '').includes('agent.md'),
+  (container.querySelector('.umem-hintbar') || {}).textContent || 'MISSING',
+)
+w.localStorage.removeItem('dsh-user-memory:active-tab')
 
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURE(S)`)
 process.exit(failures === 0 ? 0 : 1)

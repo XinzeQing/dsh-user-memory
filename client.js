@@ -15,6 +15,12 @@ window.__ModuleLoader__.load({
     // The other pseudo-tab: the temporary working set. Same shape as the other
     // keys on purpose — the panel's dirty/active logic keys off `file`.
     const TEMP_KEY = '__temp__';
+    // Where the panel opens, and where it comes back to. 临时记忆 is the tab the
+    // user acts on most of the time; landing on 必须遵守 is just the first file in
+    // the list, not a decision. The last tab the user chose is remembered so a
+    // reopened panel does not silently jump back to the first file.
+    const DEFAULT_TAB = TEMP_KEY;
+    const ACTIVE_TAB_KEY = 'dsh-user-memory:active-tab';
 
     // Chinese-first labels: the user should never have to read a filename.
     const FILES = [
@@ -36,6 +42,28 @@ window.__ModuleLoader__.load({
       },
       { file: PENDING_KEY, title: '待确认', hint: 'AI 提议，用户点「采纳」才会写进记忆；采纳后到 AI 下一轮开跑之前可以撤销' },
     ]);
+
+    // localStorage may be missing or throw (private mode, embedded webview), and
+    // a panel that cannot remember a tab is a nuisance, not an error: every
+    // access degrades to the default instead of breaking the render.
+    const isKnownTab = (value) => TABS.some((entry) => entry.file === value);
+    const readActiveTab = () => {
+      try {
+        const saved = window.localStorage.getItem(ACTIVE_TAB_KEY);
+        if (typeof saved === 'string' && isKnownTab(saved)) return saved;
+      } catch (error) {
+        /* no storage: fall through to the default */
+      }
+      return DEFAULT_TAB;
+    };
+    const writeActiveTab = (file) => {
+      if (!isKnownTab(file)) return;
+      try {
+        window.localStorage.setItem(ACTIVE_TAB_KEY, file);
+      } catch (error) {
+        /* no storage: the panel still switches, it just forgets next time */
+      }
+    };
 
     const CSS = [
       '.umem-root{display:flex;flex-direction:column;height:100%;min-height:0;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);}',
@@ -132,7 +160,7 @@ window.__ModuleLoader__.load({
       const [dir, setDir] = useState('');
       const [saved, setSaved] = useState({});
       const [drafts, setDrafts] = useState({});
-      const [active, setActive] = useState(FILES[0].file);
+      const [active, setActive] = useState(readActiveTab);
       const [message, setMessage] = useState(null);
       const [saving, setSaving] = useState(false);
       const [suggestions, setSuggestions] = useState([]);
@@ -147,6 +175,9 @@ window.__ModuleLoader__.load({
       const [temps, setTemps] = useState([]);
       const [tempPath, setTempPath] = useState('');
       const [tempEnabled, setTempEnabled] = useState(true);
+      // False until the host has answered once: the tab fallback below must not
+      // fire on the optimistic `true` above and fight the user for one frame.
+      const [tempKnown, setTempKnown] = useState(false);
       const [tempForm, setTempForm] = useState({ id: '', kind: 'handoff', title: '', body: '' });
       const [tempBusy, setTempBusy] = useState('');
 
@@ -210,6 +241,7 @@ window.__ModuleLoader__.load({
             setTemps(Array.isArray(data.items) ? data.items : []);
             setTempPath(typeof data.path === 'string' ? data.path : '');
             setTempEnabled(data.enabled !== false);
+            setTempKnown(true);
           }
         } catch (error) {
           /* keep whatever we already had */
@@ -222,20 +254,35 @@ window.__ModuleLoader__.load({
         void loadTemp();
       }, [load, loadSuggestions, loadTemp]);
 
-      // While either mirrored tab is open, pick up what changed outside the
-      // panel: a suggestion I make mid-turn, or a temp entry I write/archive.
+      // Both mirrored tabs are polled on one timer, whatever tab is showing: the
+      // badge counts on the tab strip are how the user notices that a temp entry
+      // was written or archived mid-turn, so they must stay live while another
+      // tab is open. Both reads are cheap (local files, the host's in-process
+      // store), and a poll never overwrites half-typed text: the 补充草稿 keeps
+      // its draft, the editor keeps its own state.
       useEffect(
         function () {
-          if (active !== PENDING_KEY && active !== TEMP_KEY) return undefined;
           const handle = setInterval(function () {
-            if (active === PENDING_KEY) void loadSuggestions();
-            else void loadTemp();
+            void loadSuggestions();
+            void loadTemp();
           }, 5000);
           return function () {
             clearInterval(handle);
           };
         },
-        [active, loadSuggestions, loadTemp],
+        [loadSuggestions, loadTemp],
+      );
+
+      // A profile with `tempMemory: false` has no working set to show: opening
+      // the panel on that tab would greet the user with "未启用" instead of the
+      // files the panel exists for. Once the host has said so, move off it.
+      useEffect(
+        function () {
+          if (!tempKnown || tempEnabled || active !== TEMP_KEY) return;
+          setActive(FILES[0].file);
+          writeActiveTab(FILES[0].file);
+        },
+        [tempKnown, tempEnabled, active],
       );
 
       const dirty = FILES.some((entry) => (drafts[entry.file] || '') !== (saved[entry.file] || ''));
@@ -845,6 +892,7 @@ window.__ModuleLoader__.load({
                 'data-on': entry.file === active ? '1' : '0',
                 onClick: function () {
                   setActive(entry.file);
+                  writeActiveTab(entry.file);
                   setMessage(null);
                   if (entry.file === PENDING_KEY) void loadSuggestions();
                   if (entry.file === TEMP_KEY) void loadTemp();
