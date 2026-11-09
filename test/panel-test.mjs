@@ -102,6 +102,30 @@ const tempReply = () => ({
   open: tempOpen(),
 })
 
+// The 工作流 / 短期目标 store, mirrored across the route boundary. Definitions
+// and picks live in one file on the host; the panel only authors definitions.
+let modeStore = { workflows: [], goals: [], defaultWorkflow: '', sessions: {} }
+const modeReply = (sessionId = '') => {
+  const pick = modeStore.sessions[sessionId] || {}
+  const flow = modeStore.workflows.find((i) => i.id === (pick.workflow && pick.workflow !== '__none__' ? pick.workflow : modeStore.defaultWorkflow))
+  const goal = modeStore.goals.find((i) => i.id === pick.goal)
+  return {
+    ok: true,
+    path: 'C:\\Users\\example\\.dsh\\memory\\modes.json',
+    workflows: modeStore.workflows.map((i) => Object.assign({}, i)),
+    goals: modeStore.goals.map((i) => Object.assign({}, i)),
+    defaultWorkflow: modeStore.defaultWorkflow,
+    sessionId,
+    session: { workflow: pick.workflow || '', goal: pick.goal || '' },
+    selected: {
+      workflow: flow ? flow.id : '',
+      workflowName: flow ? flow.name : '',
+      goal: goal ? goal.id : '',
+      goalName: goal ? goal.name : '',
+    },
+  }
+}
+
 function route(payload) {
   sent.push(payload)
   if (payload.action === 'load') {
@@ -111,6 +135,33 @@ function route(payload) {
       files: FILES.map((file) => ({ file, content: '' })),
       autoCapture: capture,
     }
+  }
+  if (payload.action === 'modesLoad') return modeReply(payload.sessionId || '')
+  if (payload.action === 'modeSave') {
+    if (payload.id) {
+      const item = modeStore[payload.kind === 'goal' ? 'goals' : 'workflows'].find((i) => i.id === payload.id)
+      item.name = payload.name
+      item.body = payload.body
+    } else {
+      const id = (payload.kind === 'goal' ? 'g' : 'w') + '-' + String(modeStore.workflows.length + modeStore.goals.length + 1)
+      modeStore[payload.kind === 'goal' ? 'goals' : 'workflows'].push({ id, name: payload.name, body: payload.body })
+    }
+    return modeReply('')
+  }
+  if (payload.action === 'modeDefault') {
+    modeStore.defaultWorkflow = payload.id
+    return modeReply('')
+  }
+  if (payload.action === 'modeDelete') {
+    modeStore[payload.kind === 'goal' ? 'goals' : 'workflows'] = modeStore[payload.kind === 'goal' ? 'goals' : 'workflows'].filter((i) => i.id !== payload.id)
+    if (modeStore.defaultWorkflow === payload.id) modeStore.defaultWorkflow = ''
+    return modeReply('')
+  }
+  if (payload.action === 'sessionMode') {
+    const pick = modeStore.sessions[payload.sessionId] || (modeStore.sessions[payload.sessionId] = {})
+    if (payload.id === '') delete pick[payload.kind]
+    else pick[payload.kind] = payload.id
+    return modeReply(payload.sessionId)
   }
   if (payload.action === 'autoCapture') {
     if (typeof payload.on !== 'boolean') return { ok: false, error: '开关状态必须是布尔值' }
@@ -388,7 +439,7 @@ check('panel: a panel-driven state drops the config wording', !text().includes('
 // ---------- 9. the 临时记忆 tab ----------
 // It must sit before 待确认 (the pending tab is found by position), show the
 // store the host reports, and route every action through the host.
-const TAB_LABELS = ['必须遵守', '行为设定', '用户画像', '可选遵守', '变更日志', '临时记忆', '待确认']
+const TAB_LABELS = ['必须遵守', '行为设定', '用户画像', '可选遵守', '变更日志', '临时记忆', '工作流 / 目标', '待确认']
 const tabButtons = () =>
   [...container.querySelectorAll('button')].filter((b) =>
     TAB_LABELS.some((t) => b.textContent.trim().startsWith(t)),
@@ -396,7 +447,7 @@ const tabButtons = () =>
 const tabIndex = (label) => tabButtons().findIndex((b) => b.textContent.trim().startsWith(label))
 check(
   'panel: the 临时记忆 tab is a tab of its own, and 待确认 stays last',
-  tabIndex('临时记忆') >= 0 && tabIndex('临时记忆') < tabIndex('待确认') && tabButtons().length === TAB_LABELS.length,
+  tabIndex('临时记忆') >= 0 && tabIndex('临时记忆') < tabIndex('待确认') && tabIndex('工作流 / 目标') < tabIndex('待确认') && tabButtons().length === TAB_LABELS.length,
   tabButtons().map((b) => b.textContent.trim()).join(' / '),
 )
 
@@ -484,6 +535,68 @@ await click(buttonByText('删除'))
 check(
   'panel: 删除 sends tempDelete and says the archive goes with it',
   sent.some((p) => p.action === 'tempDelete' && p.id === '9') && text().includes('连归档一起'),
+)
+
+// ---------- 10. the 工作流 / 短期目标 tab ----------
+await click(buttonByText('工作流 / 目标'))
+check(
+  'panel: the modes tab explains that an empty list changes nothing',
+  text().includes('还没有。点下面的按钮写第一条；不写就什么都不影响。') && text().includes('没有默认，不选就完全不加'),
+)
+
+await click(buttonByText('＋ 新建工作流'))
+check('panel: 新建工作流 opens an empty authoring form', container.querySelector('.umem-input') !== null && container.querySelector('.umem-bigt') !== null)
+await textType(container.querySelector('.umem-input'), '硬件模块验证')
+await type(container.querySelector('.umem-bigt'), '一次只推进一个模块，用户自己接线。')
+check('panel: typing a workflow writes nothing', sent.every((p) => p.action !== 'modeSave'))
+await click(buttonByText('保存'))
+check(
+  'panel: 保存 sends the workflow to modeSave',
+  sent.some((p) => p.action === 'modeSave' && p.kind === 'workflow' && p.id === '' && p.name === '硬件模块验证' && p.body.includes('一次只推进一个模块')),
+  JSON.stringify(sent.filter((p) => p.action === 'modeSave')),
+)
+check('panel: the saved workflow is listed with its body', text().includes('硬件模块验证') && text().includes('一次只推进一个模块'))
+check('panel: a workflow offers 编辑 / 设为默认 / 删除', buttonByText('设为默认') !== undefined && buttonByText('删除') !== undefined && buttonByText('编辑') !== undefined)
+
+await click(buttonByText('设为默认'))
+check(
+  'panel: 设为默认 sends modeDefault',
+  sent.some((p) => p.action === 'modeDefault' && p.id === 'w-1'),
+  JSON.stringify(sent.filter((p) => p.action === 'modeDefault')),
+)
+check('panel: the default is announced and badged', text().includes('设为默认工作流') && text().includes('默认'))
+
+await click(buttonByText('＋ 新建短期目标'))
+await textType(container.querySelector('.umem-input'), '光电赛 A 题')
+await type(container.querySelector('.umem-bigt'), '本届光电设计大赛 A 题，宿舍条件验证。')
+await click(buttonByText('保存'))
+check(
+  'panel: a goal goes to modeSave with kind=goal',
+  sent.some((p) => p.action === 'modeSave' && p.kind === 'goal' && p.name === '光电赛 A 题'),
+)
+
+// ---------- 11. the composer chip falls back to a select ----------
+// The primitive menu is not resolvable in this test (and may be missing in an
+// older shell), so the chip must still let the user switch modes.
+const flowChip = registered.find((r) => r.def.id === 'user-memory-workflow')
+check('client: registers a workflow chip in the composer', Boolean(flowChip))
+const chipHost = document.createElement('div')
+document.body.appendChild(chipHost)
+const chipRoot = createRoot(chipHost)
+await flush(() => { chipRoot.render(React.createElement(flowChip.comp, { sessionId: 'sess-1' })) })
+const chipSelect = chipHost.querySelector('select')
+check('panel: the chip falls back to a select without the primitive', chipSelect !== null && chipSelect.options.length >= 3, chipSelect ? chipSelect.options.length : 'MISSING')
+const flowOption = [...chipSelect.options].find((o) => o.textContent.includes('硬件模块验证'))
+check('panel: the chip lists the authored workflow', flowOption !== undefined)
+await flush(() => {
+  const setter = Object.getOwnPropertyDescriptor(w.HTMLSelectElement.prototype, 'value').set
+  setter.call(chipSelect, flowOption.value)
+  chipSelect.dispatchEvent(new w.Event('change', { bubbles: true }))
+})
+check(
+  'panel: choosing in the chip sends sessionMode for that session',
+  sent.some((p) => p.action === 'sessionMode' && p.sessionId === 'sess-1' && p.kind === 'workflow' && p.id === flowOption.value),
+  JSON.stringify(sent.filter((p) => p.action === 'sessionMode')),
 )
 
 // ---------- reopen: the last tab survives a re-mount ----------

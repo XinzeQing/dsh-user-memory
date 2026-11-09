@@ -30,6 +30,15 @@
  * -490), and every entry is either open or archived — an archived entry leaves
  * the prompt immediately, which is what keeps this layer from becoming a second
  * long-term memory. Off unless `config.tempMemory === true`.
+ *
+ * 工作流 / 短期目标 (session modes)
+ * --------------------------------
+ * Two lists the user authors, picked PER CONVERSATION from a chip beside the
+ * composer: a 工作流 says how the AI should work, a 短期目标 says what this
+ * conversation is for. A workflow may have a deployment default; a goal never
+ * does — an unselected goal injects nothing. Because the pick is per session,
+ * the two blocks are registered on each agent's own systemPrompt (order -485 and
+ * -480), not on the plugin's global section.
  */
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -38,8 +47,8 @@ import { randomUUID } from 'node:crypto'
 
 /** Row/plugin identity. */
 export const name = 'user-memory'
-/** Hard dependencies: the section registry this plugin contributes to, and the tool registry. */
-export const inject = ['systemPrompt', 'tools']
+/** Hard dependencies: the prompt registry, the tool registry, and the live agent list (session modes need every agent's scope). */
+export const inject = ['systemPrompt', 'tools', 'agents']
 
 /** The section name this plugin claims; unique so it shadows nothing. */
 const SECTION_NAME = 'user-memory'
@@ -126,6 +135,27 @@ const TEMP_ARCHIVE_KEEP = 20
 const TEMP_ARCHIVE_DAYS = 30
 /** Room reserved inside the temp budget for the "not injected, see the file" note. */
 const TEMP_NOTE_RESERVE = 120
+
+// ---- 工作流 / 短期目标（会话级模式） -----------------------------------------
+//
+// The two lists live in one JSON file the user owns, beside the memory files.
+// Definitions are global to the profile; the PICK is per session, because "this
+// conversation uses the hardware workflow, that one is a literature chat" is the
+// whole point of a session-level control. A workflow may carry a default; a goal
+// never does, so an empty goal adds zero bytes to the prompt.
+const MODES_FILE = 'modes.json'
+const WORKFLOW_SECTION_NAME = 'user-memory-workflow'
+const GOAL_SECTION_NAME = 'user-memory-goal'
+/** After the long-term block (-500) and the temp set (-490), still above the persona (0). */
+const WORKFLOW_SECTION_ORDER = -485
+const GOAL_SECTION_ORDER = -480
+/** A pick that deliberately selects nothing, as opposed to "follow the default". */
+const NONE_PICK = '__none__'
+const MAX_MODE_NAME = 40
+const MAX_MODE_BODY = 12000
+const MAX_MODES_PER_KIND = 60
+/** Session picks are tiny; this only stops an ever-growing map. Oldest go first. */
+const MAX_SESSION_PICKS = 400
 
 /** Injected order: behaviour-shaping first, descriptive later, soft last. */
 const SECTIONS = [
@@ -418,7 +448,7 @@ function userMessage(text) {
 function acceptedText(items) {
   const lines = [
     '<MEMORY_SUGGESTION_ACCEPTED>',
-    '用户在右侧「长期记忆 → 待确认」里采纳了这些记忆建议：',
+    '用户在右侧「多功能记忆 → 待确认」里采纳了这些记忆建议：',
   ]
   for (const item of items) {
     lines.push('', `#${item.id} → ${item.file}`)
@@ -614,6 +644,127 @@ export async function apply(ctx, config = {}) {
 
   await loadTempStore()
 
+  // ---- 工作流 / 短期目标：存储 ------------------------------------------------
+  //
+  // Same tolerance as the other stores: unreadable or hand-edited JSON degrades
+  // to "nothing defined" instead of failing the plugin. The file is created on
+  // the first save only, so a profile that never opens the tab keeps its memory
+  // directory exactly as before (and the scaffold test's five files stay five).
+  const modesPath = join(dir, MODES_FILE)
+  let modes = { workflows: [], goals: [], defaultWorkflow: '', sessions: {} }
+
+  const cleanMode = (item) => {
+    if (item === null || typeof item !== 'object') return null
+    const id = typeof item.id === 'string' ? item.id.trim() : ''
+    const name = typeof item.name === 'string' ? item.name.trim().slice(0, MAX_MODE_NAME) : ''
+    const body = typeof item.body === 'string' ? item.body : ''
+    if (id === '' || name === '' || body.trim() === '') return null
+    return {
+      id,
+      name,
+      body,
+      createdAt: typeof item.createdAt === 'string' ? item.createdAt : '',
+      updatedAt: typeof item.updatedAt === 'string' ? item.updatedAt : '',
+    }
+  }
+
+  const normalizeModes = (raw) => {
+    const next = { workflows: [], goals: [], defaultWorkflow: '', sessions: {} }
+    if (raw === null || typeof raw !== 'object') return next
+    for (const kind of ['workflow', 'goal']) {
+      const field = kind === 'workflow' ? 'workflows' : 'goals'
+      const source = raw[field]
+      if (!Array.isArray(source)) continue
+      const seen = new Set()
+      for (const entry of source) {
+        const item = cleanMode(entry)
+        if (item === null || seen.has(item.id)) continue
+        seen.add(item.id)
+        next[field].push(item)
+      }
+    }
+    const wantedDefault = typeof raw.defaultWorkflow === 'string' ? raw.defaultWorkflow : ''
+    if (next.workflows.some((item) => item.id === wantedDefault)) next.defaultWorkflow = wantedDefault
+    if (raw.sessions !== null && typeof raw.sessions === 'object' && !Array.isArray(raw.sessions)) {
+      for (const [sessionId, pick] of Object.entries(raw.sessions)) {
+        if (sessionId === '' || pick === null || typeof pick !== 'object') continue
+        const entry = {}
+        if (typeof pick.workflow === 'string') {
+          const id = pick.workflow
+          if (id === NONE_PICK || next.workflows.some((item) => item.id === id)) entry.workflow = id
+        }
+        if (typeof pick.goal === 'string') {
+          const id = pick.goal
+          if (id === NONE_PICK || next.goals.some((item) => item.id === id)) entry.goal = id
+        }
+        if (Object.keys(entry).length > 0) next.sessions[sessionId] = entry
+      }
+    }
+    return next
+  }
+
+  const loadModes = async () => {
+    try {
+      modes = normalizeModes(JSON.parse(await readFile(modesPath, 'utf8')))
+    } catch {
+      // No file yet — and none is created until the user saves one.
+    }
+  }
+
+  const saveModes = async () => {
+    await mkdir(dir, { recursive: true })
+    await writeFile(modesPath, JSON.stringify(jsonSafe(modes), null, 2), 'utf8')
+  }
+
+  const modeList = (kind) => (kind === 'workflow' ? modes.workflows : modes.goals)
+  const findMode = (kind, id) =>
+    id === '' ? null : modeList(kind).find((item) => item.id === id) || null
+  const sessionPick = (sessionId) => modes.sessions[String(sessionId || '')] || {}
+
+  /** The workflow a conversation runs with: explicit pick, then its explicit "none", then the default. */
+  const workflowFor = (sessionId) => {
+    const pick = sessionPick(sessionId).workflow
+    if (pick === NONE_PICK) return null
+    if (typeof pick === 'string' && pick !== '') return findMode('workflow', pick)
+    return findMode('workflow', modes.defaultWorkflow)
+  }
+
+  /** A goal has no default by design: unselected means "no goal", not "the last one". */
+  const goalFor = (sessionId) => {
+    const pick = sessionPick(sessionId).goal
+    if (typeof pick !== 'string' || pick === '' || pick === NONE_PICK) return null
+    return findMode('goal', pick)
+  }
+
+  const renderMode = (label, item) => (item === null ? '' : `## ${label}：${item.name}\n\n${item.body}`)
+
+  await loadModes()
+
+  /** One shape for every mode response, so the panel and the composer chip read the same fields. */
+  const modesPayload = (sessionId) => {
+    const pick = sessionPick(sessionId)
+    const workflow = workflowFor(sessionId)
+    const goal = goalFor(sessionId)
+    return {
+      ok: true,
+      path: modesPath,
+      workflows: modes.workflows,
+      goals: modes.goals,
+      defaultWorkflow: modes.defaultWorkflow,
+      sessionId,
+      session: {
+        workflow: typeof pick.workflow === 'string' ? pick.workflow : '',
+        goal: typeof pick.goal === 'string' ? pick.goal : '',
+      },
+      selected: {
+        workflow: workflow === null ? '' : workflow.id,
+        workflowName: workflow === null ? '' : workflow.name,
+        goal: goal === null ? '' : goal.id,
+        goalName: goal === null ? '' : goal.name,
+      },
+    }
+  }
+
   /**
    * `ctx.tools.register()` takes a finished JSON Schema, not the `defineTool`
    * spec form. Passing the spec form — as this plugin did at first, i.e.
@@ -643,7 +794,7 @@ export async function apply(ctx, config = {}) {
   const suggestTool = {
     name: 'memory_suggest',
     description:
-      '把一条「长期记忆」的修改建议放进待确认区，等用户在右侧面板点「采纳」。这个工具不写任何文件：' +
+      '把一条「记忆」的修改建议放进待确认区，等用户在右侧面板点「采纳」。这个工具不写任何文件：' +
       '用户采纳后你会在下一轮收到通知，那时才由你总结并写入。用户说了「记住」、或你发现值得长期保留的' +
       '偏好与规矩时用它提议，一次一条。',
     parameters: toolSchema({
@@ -976,6 +1127,80 @@ export async function apply(ctx, config = {}) {
     )
   }
 
+  // ---- 工作流 / 短期目标：按会话注册 -------------------------------------------
+  //
+  // A GLOBAL section cannot express "this conversation only". Registering inside
+  // `agent.ctx` gives each agent its own sections (Cordis: a section in a narrower
+  // scope shadows a global one with the same name), and the text closure reads
+  // the pick at assembly time — so a click in the panel or the chip reaches the
+  // very next model step without a restart. Same install/dispose pattern as
+  // `dsh-file-reference-local` (lib/index.js:339-372).
+  const modeFibers = new Map()
+
+  const sessionIdOf = (agent) => {
+    const id = agent?.session?.id ?? agent?.id
+    return typeof id === 'string' ? id : ''
+  }
+
+  const installModes = (agent) => {
+    if (agent === null || typeof agent !== 'object') return
+    if (modeFibers.has(agent)) return
+    try {
+      const fiber = agent.ctx.inject(['systemPrompt'], (scope) => {
+        scope.systemPrompt.section({
+          name: WORKFLOW_SECTION_NAME,
+          order: WORKFLOW_SECTION_ORDER,
+          interpolate: false,
+          text: () => renderMode('当前工作流', workflowFor(sessionIdOf(agent))),
+        })
+        scope.systemPrompt.section({
+          name: GOAL_SECTION_NAME,
+          order: GOAL_SECTION_ORDER,
+          interpolate: false,
+          text: () => renderMode('当前短期目标', goalFor(sessionIdOf(agent))),
+        })
+      })
+      modeFibers.set(agent, fiber)
+    } catch (error) {
+      ctx.logger?.warn?.(`user-memory: could not install the per-session mode sections: ${String(error)}`)
+    }
+  }
+
+  const dropModes = (agent) => {
+    const fiber = modeFibers.get(agent)
+    if (fiber === undefined) return
+    modeFibers.delete(agent)
+    try {
+      Promise.resolve(fiber.dispose()).catch((error) =>
+        ctx.logger?.warn?.(`user-memory: mode section cleanup failed: ${String(error)}`),
+      )
+    } catch (error) {
+      ctx.logger?.warn?.(`user-memory: mode section cleanup failed: ${String(error)}`)
+    }
+  }
+
+  try {
+    for (const agent of ctx.agents?.list?.() ?? []) installModes(agent)
+  } catch (error) {
+    ctx.logger?.warn?.(`user-memory: could not enumerate agents: ${String(error)}`)
+  }
+  ctx.on('agent/created', ({ agent }) => {
+    installModes(agent)
+  })
+  ctx.on('agent/disposed', ({ agent }) => {
+    dropModes(agent)
+  })
+  ctx.effect(() => () => {
+    for (const fiber of modeFibers.values()) {
+      try {
+        void fiber.dispose?.()
+      } catch (error) {
+        /* shutting down */
+      }
+    }
+    modeFibers.clear()
+  })
+
   // The graphical panel's only backend. Both actions are read/write of files
   // this plugin already owns; the file name is checked against a fixed list.
   const handle = async (request) => {
@@ -1201,6 +1426,135 @@ export async function apply(ctx, config = {}) {
       await saveTempStore()
       await refresh()
       return Response.json({ ok: true, removed, items: tempStore.items, open: openTempCount() })
+    }
+
+    // ---- 工作流 / 短期目标：面板和会话芯片 ------------------------------------
+    //
+    // Definitions are authored here (one list each); the pick is written by the
+    // chip and lives in the same file, keyed by session id. The host never
+    // derives a pick from a conversation's content — only the user's click does.
+    if (action === 'modesLoad') {
+      const sessionId = typeof payload?.sessionId === 'string' ? payload.sessionId : ''
+      return Response.json(modesPayload(sessionId))
+    }
+
+    if (action === 'modeSave') {
+      const kind = payload?.kind === 'workflow' || payload?.kind === 'goal' ? payload.kind : ''
+      if (kind === '') {
+        return Response.json({ ok: false, error: '类型必须是 workflow 或 goal' }, { status: 400 })
+      }
+      const name = typeof payload?.name === 'string' ? payload.name.trim() : ''
+      const body = typeof payload?.body === 'string' ? payload.body : ''
+      if (name === '') return Response.json({ ok: false, error: '名称不能为空' }, { status: 400 })
+      if (name.length > MAX_MODE_NAME) {
+        return Response.json({ ok: false, error: `名称过长（上限 ${MAX_MODE_NAME} 字）` }, { status: 413 })
+      }
+      if (body.trim() === '') {
+        return Response.json({ ok: false, error: '正文不能为空（空正文不会注入）' }, { status: 400 })
+      }
+      if (body.length > MAX_MODE_BODY) {
+        return Response.json({ ok: false, error: `正文过长（上限 ${MAX_MODE_BODY} 字符）` }, { status: 413 })
+      }
+      const list = modeList(kind)
+      const given = typeof payload?.id === 'string' ? payload.id : ''
+      const now = new Date().toISOString()
+      let id = given
+      if (given === '') {
+        if (list.length >= MAX_MODES_PER_KIND) {
+          return Response.json(
+            { ok: false, error: `最多 ${MAX_MODES_PER_KIND} 个${kind === 'workflow' ? '工作流' : '短期目标'}` },
+            { status: 400 },
+          )
+        }
+        id = `${kind === 'workflow' ? 'w' : 'g'}-${Date.now().toString(36)}-${randomUUID().slice(0, 4)}`
+        list.push({ id, name, body, createdAt: now, updatedAt: now })
+      } else {
+        const item = list.find((entry) => entry.id === given)
+        if (item === undefined) {
+          return Response.json({ ok: false, error: '找不到这一条' }, { status: 404 })
+        }
+        item.name = name
+        item.body = body
+        item.updatedAt = now
+      }
+      try {
+        await saveModes()
+      } catch (error) {
+        ctx.logger?.warn?.(`user-memory: modes write failed ${modesPath}: ${String(error)}`)
+        return Response.json({ ok: false, error: '写入失败，请查看日志' }, { status: 500 })
+      }
+      return Response.json(Object.assign(modesPayload(''), { id }))
+    }
+
+    if (action === 'modeDelete') {
+      const kind = payload?.kind === 'workflow' || payload?.kind === 'goal' ? payload.kind : ''
+      if (kind === '') {
+        return Response.json({ ok: false, error: '类型必须是 workflow 或 goal' }, { status: 400 })
+      }
+      const id = typeof payload?.id === 'string' ? payload.id : ''
+      const list = modeList(kind)
+      const index = list.findIndex((entry) => entry.id === id)
+      if (index < 0) return Response.json({ ok: false, error: '找不到这一条' }, { status: 404 })
+      list.splice(index, 1)
+      if (kind === 'workflow' && modes.defaultWorkflow === id) modes.defaultWorkflow = ''
+      // A deleted mode must not linger as a dangling session pick: those sessions
+      // fall back to the default (workflow) or to nothing (goal).
+      for (const [sessionId, pick] of Object.entries(modes.sessions)) {
+        if (pick[kind] !== id) continue
+        delete pick[kind]
+        if (Object.keys(pick).length === 0) delete modes.sessions[sessionId]
+      }
+      try {
+        await saveModes()
+      } catch (error) {
+        ctx.logger?.warn?.(`user-memory: modes write failed ${modesPath}: ${String(error)}`)
+        return Response.json({ ok: false, error: '写入失败，请查看日志' }, { status: 500 })
+      }
+      return Response.json(modesPayload(''))
+    }
+
+    if (action === 'modeDefault') {
+      const id = typeof payload?.id === 'string' ? payload.id : ''
+      if (id !== '' && !modes.workflows.some((item) => item.id === id)) {
+        return Response.json({ ok: false, error: '找不到这个工作流' }, { status: 404 })
+      }
+      modes.defaultWorkflow = id
+      try {
+        await saveModes()
+      } catch (error) {
+        ctx.logger?.warn?.(`user-memory: modes write failed ${modesPath}: ${String(error)}`)
+        return Response.json({ ok: false, error: '写入失败，请查看日志' }, { status: 500 })
+      }
+      return Response.json(modesPayload(''))
+    }
+
+    if (action === 'sessionMode') {
+      const sessionId = typeof payload?.sessionId === 'string' ? payload.sessionId.trim() : ''
+      if (sessionId === '') {
+        return Response.json({ ok: false, error: '缺少会话 ID' }, { status: 400 })
+      }
+      const kind = payload?.kind === 'workflow' || payload?.kind === 'goal' ? payload.kind : ''
+      if (kind === '') {
+        return Response.json({ ok: false, error: '类型必须是 workflow 或 goal' }, { status: 400 })
+      }
+      const id = typeof payload?.id === 'string' ? payload.id : ''
+      if (id !== '' && id !== NONE_PICK && !modeList(kind).some((item) => item.id === id)) {
+        return Response.json({ ok: false, error: '找不到这一条' }, { status: 404 })
+      }
+      const pick = modes.sessions[sessionId] || {}
+      if (id === '') delete pick[kind]
+      else pick[kind] = id
+      if (Object.keys(pick).length === 0) delete modes.sessions[sessionId]
+      else modes.sessions[sessionId] = pick
+      const keys = Object.keys(modes.sessions)
+      while (keys.length > MAX_SESSION_PICKS) delete modes.sessions[keys.shift()]
+      try {
+        await saveModes()
+      } catch (error) {
+        ctx.logger?.warn?.(`user-memory: modes write failed ${modesPath}: ${String(error)}`)
+        return Response.json({ ok: false, error: '写入失败，请查看日志' }, { status: 500 })
+      }
+      return Response.json(modesPayload(sessionId))
     }
 
     if (action === 'save') {

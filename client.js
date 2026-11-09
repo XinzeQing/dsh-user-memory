@@ -1,11 +1,24 @@
-// Browser half of dsh-user-memory: the sidebar entry and the 长期记忆 panel.
-// Loaded by the Harness client module loader; `id` must equal the package name.
+// Browser half of dsh-user-memory: the sidebar entry and the 多功能记忆 panel.
+// Also the two session chips beside the composer (工作流 / 短期目标), which is why
+// this half also registers into `conversation.input.left`.
 window.__ModuleLoader__.load({
   id: 'dsh-user-memory',
   factory(require) {
     const React = require('react');
     const h = React.createElement;
     const { useCallback, useEffect, useState } = React;
+
+    // The harness' own menu primitive, so the chip looks and behaves like the
+    // agent-preset seat instead of hand-rolling a popover. Missing (older shell,
+    // or a profile that did not inject it) is survivable: ModeChip then renders a
+    // plain <select>, which still switches modes.
+    let Menu = null;
+    try {
+      const primitives = require('@deepseek-ai/dsh-client-ui-primitives');
+      Menu = typeof primitives?.Menu === 'function' ? primitives.Menu : null;
+    } catch (error) {
+      Menu = null;
+    }
 
     const ROUTE = '/api/dsh-user-memory';
     const PANEL_ID = 'user-memory';
@@ -15,12 +28,23 @@ window.__ModuleLoader__.load({
     // The other pseudo-tab: the temporary working set. Same shape as the other
     // keys on purpose — the panel's dirty/active logic keys off `file`.
     const TEMP_KEY = '__temp__';
+    // The third pseudo-tab: the two lists the session chips pick from.
+    const MODES_KEY = '__modes__';
     // Where the panel opens, and where it comes back to. 临时记忆 is the tab the
     // user acts on most of the time; landing on 必须遵守 is just the first file in
     // the list, not a decision. The last tab the user chose is remembered so a
     // reopened panel does not silently jump back to the first file.
     const DEFAULT_TAB = TEMP_KEY;
     const ACTIVE_TAB_KEY = 'dsh-user-memory:active-tab';
+    // The two chip slots' registry ids and orders. Workflow sits left of the goal
+    // because it is the one with a default and the one picked in most sessions.
+    const WORKFLOW_CHIP_ID = 'user-memory-workflow';
+    const GOAL_CHIP_ID = 'user-memory-goal';
+    const WORKFLOW_CHIP_ORDER = 20;
+    const GOAL_CHIP_ORDER = 21;
+    // The server's sentinel for "deliberately no workflow", as opposed to "" =
+    // follow the deployment default. A goal uses "" and this value alike: no goal.
+    const NONE_PICK = '__none__';
 
     // Chinese-first labels: the user should never have to read a filename.
     const FILES = [
@@ -40,6 +64,7 @@ window.__ModuleLoader__.load({
         title: '临时记忆',
         hint: '跨对话交接、阶段目标、等待项。只在用户要求时写入；标成完成后立刻从注入里消失（数据留在归档里，可恢复）',
       },
+      { file: MODES_KEY, title: '工作流 / 目标', hint: '这里写多套工作流和短期目标，会话里用输入框上方的两个小按钮选；工作流可设默认，短期目标不选就不注入' },
       { file: PENDING_KEY, title: '待确认', hint: 'AI 提议，用户点「采纳」才会写进记忆；采纳后到 AI 下一轮开跑之前可以撤销' },
     ]);
 
@@ -117,6 +142,29 @@ window.__ModuleLoader__.load({
       '.umem-badge{font-size:11px;padding:1px 8px;border-radius:9px;background:var(--dsw-alias-interactive-selected);color:var(--dsw-alias-label-secondary);}',
       '.umem-card[data-muted="1"] .umem-text{opacity:.62;}',
       '.umem-arch{margin:2px 0 0;font-size:12px;color:var(--dsw-alias-label-tertiary);}',
+      // The two composer chips. Sized and coloured like the agent-preset seat so
+      // they read as control, not as content. The label is the only text; the
+      // prefix says which one it is, so a truncation still leaves it identifiable.
+      '.umem-chip{display:inline-flex;align-items:center;gap:6px;max-width:180px;height:28px;padding:0 8px;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:transparent;color:var(--dsw-alias-label-secondary);font-family:inherit;font-size:13px;line-height:1;cursor:pointer;}',
+      '.umem-chip:hover{background:var(--dsw-alias-interactive-hover);color:var(--dsw-alias-label-primary);}',
+      '.umem-chip[data-on="1"]{color:var(--dsw-alias-label-primary);}',
+      '.umem-chip[data-on="1"] .umem-chip-dot{background:var(--dsw-alias-brand-primary);}',
+      '.umem-chip:disabled{opacity:.55;cursor:default;}',
+      '.umem-chip-dot{flex:none;width:6px;height:6px;border-radius:50%;background:var(--dsw-alias-border-l2,var(--dsw-alias-border-l1));}',
+      '.umem-chip-kind{flex:none;color:var(--dsw-alias-label-tertiary);}',
+      '.umem-chip-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
+      '.umem-chip-select{max-width:180px;height:28px;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:transparent;color:var(--dsw-alias-label-secondary);font-family:inherit;font-size:13px;}',
+      // The 工作流 / 目标 tab: two sections of cards, each card open in place.
+      '.umem-modes{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:18px;}',
+      '.umem-modesec{display:flex;flex-direction:column;gap:10px;}',
+      '.umem-sectitle{display:flex;align-items:baseline;gap:10px;font-size:13px;font-weight:600;margin:0;}',
+      '.umem-sectitle .umem-sub{font-weight:400;}',
+      '.umem-modebody{margin:6px 0 0;white-space:pre-wrap;word-break:break-word;font-size:12.5px;line-height:1.7;color:var(--dsw-alias-label-secondary);}',
+      '.umem-modecard[data-on="1"]{border-color:var(--dsw-alias-brand-primary);}',
+      '.umem-btnRow{display:flex;gap:8px;flex-wrap:wrap;align-items:center;}',
+      '.umem-mini{border:none;background:transparent;color:var(--dsw-alias-label-tertiary);font-family:inherit;font-size:12px;cursor:pointer;padding:2px 4px;border-radius:5px;}',
+      '.umem-mini:hover{background:var(--dsw-alias-interactive-hover);color:var(--dsw-alias-label-primary);}',
+      '.umem-mini[data-danger="1"]:hover{color:var(--dsw-alias-state-error-primary);}',
     ].join('\n');
 
     async function call(action, extra) {
@@ -155,6 +203,112 @@ window.__ModuleLoader__.load({
       );
     }
 
+    // One chip, one kind. Reads the session's pick and the current default on
+    // mount (and after every choice), writes through `sessionMode`, and never
+    // blocks the composer: a failed load leaves a quiet "工作流" button behind.
+    function ModeChip(props) {
+      const sessionId = typeof props.sessionId === 'string' ? props.sessionId : '';
+      const kind = props.kind === 'goal' ? 'goal' : 'workflow';
+      const label = kind === 'goal' ? '短期目标' : '工作流';
+      const [open, setOpen] = useState(false);
+      const [data, setData] = useState(null);
+      const [busy, setBusy] = useState(false);
+
+      const load = useCallback(async () => {
+        if (sessionId === '') return;
+        try {
+          const result = await call('modesLoad', { sessionId: sessionId });
+          if (result?.ok) setData(result);
+        } catch (error) {
+          /* the chip is optional: stay on the label */
+        }
+      }, [sessionId]);
+
+      useEffect(() => {
+        void load();
+      }, [load]);
+
+      const choose = async (id) => {
+        setOpen(false);
+        if (sessionId === '' || busy) return;
+        setBusy(true);
+        try {
+          const result = await call('sessionMode', { sessionId: sessionId, kind: kind, id: id });
+          if (result?.ok) setData(result);
+        } catch (error) {
+          /* leave the previous choice in place */
+        } finally {
+          setBusy(false);
+        }
+      };
+
+      const selected = data?.selected ?? {};
+      const currentName = kind === 'goal' ? selected.goalName ?? '' : selected.workflowName ?? '';
+      // "跟随默认" is shown as the default's own name, because that is what the
+      // model will actually receive; an explicit none reads as "不用".
+      const shown = currentName !== '' ? currentName : kind === 'workflow' ? '不用' : '不选';
+
+      const items = [];
+      if (kind === 'workflow') {
+        items.push({ id: '', label: data?.defaultWorkflow ? '跟随默认' : '不用（没有默认）' });
+        items.push({ id: NONE_PICK, label: '不用（本次显式关闭）' });
+      } else {
+        items.push({ id: NONE_PICK, label: '不选（不加目标）' });
+      }
+      for (const item of kind === 'goal' ? data?.goals ?? [] : data?.workflows ?? []) {
+        items.push({ id: item.id, label: item.name });
+      }
+
+      const anchor = h(
+        'button',
+        {
+          type: 'button',
+          className: 'umem-chip',
+          'data-on': currentName !== '' ? '1' : '0',
+          title: kind === 'goal' ? '这个会话的短期目标' : '这个会话的工作流',
+          disabled: sessionId === '' || busy,
+          onClick: () => {
+            if (Menu !== null) setOpen((value) => !value);
+          },
+        },
+        h('span', { className: 'umem-chip-dot' }),
+        h('span', { className: 'umem-chip-kind' }, label),
+        h('span', { className: 'umem-chip-name' }, shown),
+      );
+
+      // Fallback without the primitive: a native select does the same job with
+      // worse looks, and it is better than a button that opens nothing.
+      if (Menu === null) {
+        return h(
+          'select',
+          {
+            className: 'umem-chip-select',
+            title: label,
+            value: kind === 'goal' ? (data?.session?.goal ?? '') : (data?.session?.workflow ?? ''),
+            disabled: sessionId === '' || busy,
+            onChange: (event) => {
+              void choose(event.target.value);
+            },
+          },
+          items.map((item) => h('option', { key: `chip-${kind}-${item.id}`, value: item.id }, `${label}：${item.label}`)),
+        );
+      }
+
+      return h(Menu, {
+        open: open,
+        onClose: () => setOpen(false),
+        items: items,
+        selectedId: kind === 'goal' ? (data?.session?.goal ?? '') : (data?.session?.workflow ?? ''),
+        onSelect: (id) => {
+          void choose(id);
+        },
+        align: 'start',
+        side: 'top',
+        portal: true,
+        anchor: anchor,
+      });
+    }
+
     function Panel() {
       const [status, setStatus] = useState('loading');
       const [dir, setDir] = useState('');
@@ -180,6 +334,28 @@ window.__ModuleLoader__.load({
       const [tempKnown, setTempKnown] = useState(false);
       const [tempForm, setTempForm] = useState({ id: '', kind: 'handoff', title: '', body: '' });
       const [tempBusy, setTempBusy] = useState('');
+      // 工作流 / 短期目标：两套列表住在同一个 modes.json 里，面板是唯一编辑处。
+      // `modeForm === null` 表示表单收着；会话里的选择不在这里改，在芯片里改。
+      const [modes, setModes] = useState({ workflows: [], goals: [], defaultWorkflow: '' });
+      const [modePath, setModePath] = useState('');
+      const [modeForm, setModeForm] = useState(null);
+      const [modeBusy, setModeBusy] = useState('');
+
+      const loadModes = useCallback(async () => {
+        try {
+          const data = await call('modesLoad', {});
+          if (data && data.ok === true) {
+            setModes({
+              workflows: Array.isArray(data.workflows) ? data.workflows : [],
+              goals: Array.isArray(data.goals) ? data.goals : [],
+              defaultWorkflow: typeof data.defaultWorkflow === 'string' ? data.defaultWorkflow : '',
+            });
+            setModePath(typeof data.path === 'string' ? data.path : '');
+          }
+        } catch (error) {
+          /* keep whatever we already had */
+        }
+      }, []);
 
       const load = useCallback(async () => {
         setStatus('loading');
@@ -252,7 +428,8 @@ window.__ModuleLoader__.load({
         void load();
         void loadSuggestions();
         void loadTemp();
-      }, [load, loadSuggestions, loadTemp]);
+        void loadModes();
+      }, [load, loadSuggestions, loadTemp, loadModes]);
 
       // Both mirrored tabs are polled on one timer, whatever tab is showing: the
       // badge counts on the tab strip are how the user notices that a temp entry
@@ -442,6 +619,110 @@ window.__ModuleLoader__.load({
         setMessage(null);
       }, []);
 
+      // ---- 工作流 / 短期目标 面板动作 ---------------------------------------
+      // 列表只有四种写操作：存一条、删一条、设默认、开关一次会话的选择。
+      // 每次写完都重读，面板显示的就是磁盘上的东西，而不是客户端的推测。
+      const modeSubmit = useCallback(
+        async function () {
+          if (modeForm === null) return;
+          if (modeForm.name.trim() === '' || modeForm.body.trim() === '') {
+            setMessage({ kind: 'err', text: '名称和正文都要填。' });
+            return;
+          }
+          const editing = modeForm.id !== '';
+          setModeBusy('save');
+          setMessage(null);
+          try {
+            const data = await call('modeSave', {
+              kind: modeForm.kind,
+              id: modeForm.id,
+              name: modeForm.name,
+              body: modeForm.body,
+            });
+            if (!data || data.ok !== true) throw new Error((data && data.error) || '保存失败');
+            setModes({
+              workflows: Array.isArray(data.workflows) ? data.workflows : [],
+              goals: Array.isArray(data.goals) ? data.goals : [],
+              defaultWorkflow: typeof data.defaultWorkflow === 'string' ? data.defaultWorkflow : '',
+            });
+            setModePath(typeof data.path === 'string' ? data.path : '');
+            setModeForm(null);
+            setMessage({
+              kind: 'ok',
+              text: editing
+                ? '已保存修改。正在进行的会话下一步就会用新正文。'
+                : '已新增。去输入框上方的小按钮里把它选给某个会话。',
+            });
+          } catch (error) {
+            setMessage({
+              kind: 'err',
+              text: '保存失败：' + String(error && error.message ? error.message : error),
+            });
+          } finally {
+            setModeBusy('');
+          }
+        },
+        [modeForm],
+      );
+
+      const modeRemove = useCallback(
+        async function (kind, item) {
+          if (!window.confirm('删除「' + item.name + '」？删除后，选了它的会话会回到默认（工作流）或不再有目标（短期目标）。')) {
+            return;
+          }
+          setModeBusy('delete:' + item.id);
+          setMessage(null);
+          try {
+            const data = await call('modeDelete', { kind: kind, id: item.id });
+            if (!data || data.ok !== true) throw new Error((data && data.error) || '删除失败');
+            setModes({
+              workflows: Array.isArray(data.workflows) ? data.workflows : [],
+              goals: Array.isArray(data.goals) ? data.goals : [],
+              defaultWorkflow: typeof data.defaultWorkflow === 'string' ? data.defaultWorkflow : '',
+            });
+            if (modeForm !== null && modeForm.id === item.id) setModeForm(null);
+            setMessage({ kind: 'ok', text: '已删除「' + item.name + '」。' });
+          } catch (error) {
+            setMessage({
+              kind: 'err',
+              text: '删除失败：' + String(error && error.message ? error.message : error),
+            });
+          } finally {
+            setModeBusy('');
+          }
+        },
+        [modeForm],
+      );
+
+      const modeDefault = useCallback(
+        async function (item) {
+          const next = modes.defaultWorkflow === item.id ? '' : item.id;
+          setModeBusy('default:' + item.id);
+          setMessage(null);
+          try {
+            const data = await call('modeDefault', { id: next });
+            if (!data || data.ok !== true) throw new Error((data && data.error) || '设置失败');
+            setModes({
+              workflows: Array.isArray(data.workflows) ? data.workflows : [],
+              goals: Array.isArray(data.goals) ? data.goals : [],
+              defaultWorkflow: typeof data.defaultWorkflow === 'string' ? data.defaultWorkflow : '',
+            });
+            setMessage({
+              kind: 'ok',
+              text: next === '' ? '已取消默认工作流：没显式选过的会话不再带工作流。' : '已把「' + item.name + '」设为默认工作流。',
+            });
+          } catch (error) {
+            setMessage({
+              kind: 'err',
+              text: '设置失败：' + String(error && error.message ? error.message : error),
+            });
+          } finally {
+            setModeBusy('');
+          }
+        },
+        [modes.defaultWorkflow],
+      );
+
       const style = h('style', { key: 'umem-style' }, CSS);
 
       if (status === 'loading') {
@@ -464,8 +745,9 @@ window.__ModuleLoader__.load({
 
       const isPending = active === PENDING_KEY;
       const isTemp = active === TEMP_KEY;
-      // 两个伪标签页背后都没有文件：没有编辑器，也没有「未保存」可言。
-      const isPseudo = isPending || isTemp;
+      const isModes = active === MODES_KEY;
+      // 三个伪标签页背后都没有文件：没有编辑器，也没有「未保存」可言。
+      const isPseudo = isPending || isTemp || isModes;
       const current = isPseudo
         ? TABS.find((entry) => entry.file === active) || TABS[TABS.length - 1]
         : FILES.find((entry) => entry.file === active) || FILES[0];
@@ -837,6 +1119,191 @@ window.__ModuleLoader__.load({
         );
       }
 
+      // 工作流 / 短期目标。两套列表在同一页，因为它们的生命周期一样：写一次，
+      // 然后在每个会话里各选各的。卡片直接展开正文——这些是给模型看的指令，
+      // 不是标题清单，看不懂正文就没法判断该选哪一条。
+      function modeArea() {
+        const busy = modeBusy !== '';
+        const section = function (kind, title, note) {
+          const list = kind === 'workflow' ? modes.workflows : modes.goals;
+          const card = function (item) {
+            const isDefault = kind === 'workflow' && modes.defaultWorkflow === item.id;
+            if (modeForm !== null && modeForm.kind === kind && modeForm.id !== '' && modeForm.id === item.id) {
+              return h(
+                'div',
+                { key: item.id, className: 'umem-form' },
+                h(
+                  'div',
+                  { className: 'umem-formrow' },
+                  h('input', {
+                    className: 'umem-input',
+                    style: { flex: 1 },
+                    spellCheck: false,
+                    disabled: busy,
+                    placeholder: '名称（会话里的小按钮上显示这几个字）',
+                    value: modeForm.name,
+                    onChange: function (event) {
+                      const value = event.target.value;
+                      setModeForm((prev) => Object.assign({}, prev, { name: value }));
+                    },
+                  }),
+                  h('span', { className: 'umem-badge' }, '编辑中'),
+                ),
+                h('textarea', {
+                  className: 'umem-note umem-bigt',
+                  spellCheck: false,
+                  disabled: busy,
+                  placeholder: '正文：AI 该怎么做。写具体规则、顺序、边界条件，别写口号。',
+                  value: modeForm.body,
+                  onChange: function (event) {
+                    const value = event.target.value;
+                    setModeForm((prev) => Object.assign({}, prev, { body: value }));
+                  },
+                }),
+                h(
+                  'div',
+                  { className: 'umem-formrow' },
+                  h(
+                    'button',
+                    { className: 'umem-btn', disabled: busy, onClick: function () { void modeSubmit(); } },
+                    modeBusy === 'save' ? '保存中…' : '保存修改',
+                  ),
+                  h('button', { className: 'umem-btn', disabled: busy, onClick: function () { setModeForm(null); } }, '取消'),
+                ),
+              );
+            }
+            return h(
+              'div',
+              { key: item.id, className: 'umem-card umem-modecard', 'data-on': isDefault ? '1' : '0' },
+              h(
+                'div',
+                { className: 'umem-cardhead' },
+                h('span', { className: 'umem-target' }, item.name),
+                isDefault ? h('span', { className: 'umem-badge' }, '默认') : null,
+                h('span', { className: 'umem-stage' }, item.body.length + ' 字'),
+              ),
+              h('pre', { className: 'umem-modebody' }, item.body.length > 220 ? item.body.slice(0, 220) + '…' : item.body),
+              h(
+                'div',
+                { className: 'umem-cardfoot' },
+                h(
+                  'button',
+                  {
+                    className: 'umem-btn',
+                    disabled: busy,
+                    onClick: function () {
+                      setModeForm({ kind: kind, id: item.id, name: item.name, body: item.body });
+                      setMessage(null);
+                    },
+                  },
+                  '编辑',
+                ),
+                kind === 'workflow'
+                  ? h(
+                      'button',
+                      {
+                        className: 'umem-btn',
+                        disabled: busy || modeBusy === 'default:' + item.id,
+                        onClick: function () { void modeDefault(item); },
+                      },
+                      isDefault ? '取消默认' : '设为默认',
+                    )
+                  : null,
+                h(
+                  'button',
+                  {
+                    className: 'umem-btn',
+                    disabled: busy || modeBusy === 'delete:' + item.id,
+                    onClick: function () { void modeRemove(kind, item); },
+                  },
+                  '删除',
+                ),
+              ),
+            );
+          };
+          const creating = modeForm !== null && modeForm.kind === kind && modeForm.id === '';
+          return h(
+            'div',
+            { className: 'umem-modesec', key: kind },
+            h('div', { className: 'umem-sectitle' }, title, h('span', { className: 'umem-sub' }, note)),
+            list.length === 0 && !creating
+              ? h('div', { className: 'umem-msg' }, '还没有。点下面的按钮写第一条；不写就什么都不影响。')
+              : null,
+            list.map(card),
+            creating
+              ? h(
+                  'div',
+                  { className: 'umem-form' },
+                  h(
+                    'div',
+                    { className: 'umem-formrow' },
+                    h('input', {
+                      className: 'umem-input',
+                      style: { flex: 1 },
+                      spellCheck: false,
+                      disabled: busy,
+                      placeholder: kind === 'workflow' ? '工作流名称，例如：硬件模块验证' : '短期目标名称，例如：第 3 届光电赛 A 题',
+                      value: modeForm.name,
+                      onChange: function (event) {
+                        const value = event.target.value;
+                        setModeForm((prev) => Object.assign({}, prev, { name: value }));
+                      },
+                    }),
+                    h('span', { className: 'umem-badge' }, '新建'),
+                  ),
+                  h('textarea', {
+                    className: 'umem-note umem-bigt',
+                    spellCheck: false,
+                    disabled: busy,
+                    placeholder: '正文：AI 在这个模式下该怎么干活／这个会话要完成什么。写具体约束与验收标准。',
+                    value: modeForm.body,
+                    onChange: function (event) {
+                      const value = event.target.value;
+                      setModeForm((prev) => Object.assign({}, prev, { body: value }));
+                    },
+                  }),
+                  h(
+                    'div',
+                    { className: 'umem-formrow' },
+                    h(
+                      'button',
+                      { className: 'umem-btn', disabled: busy, onClick: function () { void modeSubmit(); } },
+                      modeBusy === 'save' ? '保存中…' : '保存',
+                    ),
+                    h('button', { className: 'umem-btn', disabled: busy, onClick: function () { setModeForm(null); } }, '取消'),
+                  ),
+                )
+              : h(
+                  'div',
+                  { className: 'umem-btnRow' },
+                  h(
+                    'button',
+                    {
+                      className: 'umem-btn',
+                      disabled: busy,
+                      onClick: function () {
+                        setModeForm({ kind: kind, id: '', name: '', body: '' });
+                        setMessage(null);
+                      },
+                    },
+                    kind === 'workflow' ? '＋ 新建工作流' : '＋ 新建短期目标',
+                  ),
+                ),
+          );
+        };
+        return h(
+          'div',
+          { className: 'umem-modes' },
+          section('workflow', '工作流', '可设一个默认；会话里没选过的就跟随默认'),
+          section('goal', '短期目标', '没有默认，不选就完全不加——不会拿上一次的目标凑数'),
+          h(
+            'div',
+            { className: 'umem-arch' },
+            '存储位置：' + (modePath || '（保存第一条时才创建）') + '　|　会话里的选择记在同一个文件里',
+          ),
+        );
+      }
+
       return h(
         'div',
         { className: 'umem-root' },
@@ -844,7 +1311,7 @@ window.__ModuleLoader__.load({
         h(
           'div',
           { className: 'umem-head' },
-          h('div', { className: 'umem-title' }, '长期记忆'),
+          h('div', { className: 'umem-title' }, '多功能记忆'),
           h('div', { className: 'umem-sub' }, '文件位置：' + (dir || '（未知）')),
           h(
             'div',
@@ -878,7 +1345,7 @@ window.__ModuleLoader__.load({
           'div',
           { className: 'umem-tabs' },
           TABS.map(function (entry) {
-            const pseudo = entry.file === PENDING_KEY || entry.file === TEMP_KEY;
+            const pseudo = entry.file === PENDING_KEY || entry.file === TEMP_KEY || entry.file === MODES_KEY;
             const entryDirty = pseudo
               ? false
               : (drafts[entry.file] || '') !== (saved[entry.file] || '');
@@ -896,6 +1363,7 @@ window.__ModuleLoader__.load({
                   setMessage(null);
                   if (entry.file === PENDING_KEY) void loadSuggestions();
                   if (entry.file === TEMP_KEY) void loadTemp();
+                  if (entry.file === MODES_KEY) void loadModes();
                 },
               },
               entry.title,
@@ -916,7 +1384,9 @@ window.__ModuleLoader__.load({
             ? waitingArea()
             : isTemp
               ? tempArea()
-              : h('textarea', {
+              : isModes
+                ? modeArea()
+                : h('textarea', {
                 className: 'umem-editor',
                 spellCheck: false,
                 value: drafts[active] || '',
@@ -940,6 +1410,7 @@ window.__ModuleLoader__.load({
                   className: 'umem-btn',
                   onClick: function () {
                     if (isTemp) void loadTemp();
+                    else if (isModes) void loadModes();
                     else void loadSuggestions();
                   },
                 },
@@ -979,7 +1450,9 @@ window.__ModuleLoader__.load({
                 ? '「采纳」只是通知 AI 下一轮来写；左下角补充框里的字，也是点「采纳」那一刻才存下来。采纳后到 AI 下一轮开跑之前，可以「撤销采纳」。'
                 : isTemp
                   ? '临时记忆有自己的预算（默认 1200 字符），不吃长期记忆的额度。只在被明确要求时才新增；标成完成的条目立刻从注入里消失——「完成即清理」，数据留在这里可恢复。'
-                  : '保存后立即生效，无需重启。注释 <!-- --> 不会注入给 AI。',
+                  : isModes
+                    ? '工作流有默认，短期目标没有：没选目标的会话不会带任何目标。改完不用重启；选过的会话下一步就用新正文。'
+                    : '保存后立即生效，无需重启。注释 <!-- --> 不会注入给 AI。',
           ),
         ),
       );
@@ -1000,8 +1473,32 @@ window.__ModuleLoader__.load({
         own(
           ctx.slots.inject('sidebar.panellist', function () {
             return ctx.slots.register(
-              { name: 'sidebar.panellist', id: PANEL_ID, order: PANEL_ORDER, label: '长期记忆' },
+              { name: 'sidebar.panellist', id: PANEL_ID, order: PANEL_ORDER, label: '多功能记忆' },
               Icon,
+            );
+          }),
+        );
+        // The two session chips. `conversation.input.left` is the compact control
+        // strip on the composer's tool row (session-scoped), which is exactly where
+        // a per-conversation choice belongs — the agent-preset seat is new-session
+        // only, so it cannot carry these.
+        own(
+          ctx.slots.inject('conversation.input.left', function () {
+            return ctx.slots.register(
+              { name: 'conversation.input.left', id: WORKFLOW_CHIP_ID, order: WORKFLOW_CHIP_ORDER },
+              function WorkflowChip(props) {
+                return h(ModeChip, { sessionId: props.sessionId, kind: 'workflow' });
+              },
+            );
+          }),
+        );
+        own(
+          ctx.slots.inject('conversation.input.left', function () {
+            return ctx.slots.register(
+              { name: 'conversation.input.left', id: GOAL_CHIP_ID, order: GOAL_CHIP_ORDER },
+              function GoalChip(props) {
+                return h(ModeChip, { sessionId: props.sessionId, kind: 'goal' });
+              },
             );
           }),
         );
