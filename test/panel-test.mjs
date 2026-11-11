@@ -126,14 +126,71 @@ const modeReply = (sessionId = '') => {
   }
 }
 
+// The 条目 docs the load route hands the panel (0.8.2). The editor is a view over
+// these, so the stub has to carry the same shape the host's parseDoc produces.
+const docs = {
+  'rules-must.md': {
+    title: '必须遵守',
+    comments: ['<!-- 手写备注 -->'],
+    preamble: [],
+    groups: [
+      {
+        title: '硬性要求',
+        sep: '\n\n',
+        entries: [
+          { kind: 'bullet', text: '- 回答短一点。', sep: '\n\n' },
+          { kind: 'bullet', text: '- 不许写假大空。', sep: '\n' },
+        ],
+      },
+    ],
+  },
+}
+const reportFor = (file) => ({
+  budget: 6000,
+  totalChars: 20,
+  injectedChars: 10,
+  dropped: 1,
+  sections: [
+    {
+      file,
+      title: '',
+      chars: 20,
+      injectedChars: 10,
+      fitted: 'partial',
+      entries: [
+        { entryIndex: 0, chars: 10, fitted: 'full' },
+        { entryIndex: 1, chars: 10, fitted: 'dropped' },
+      ],
+    },
+  ],
+})
+
 function route(payload) {
   sent.push(payload)
   if (payload.action === 'load') {
     return {
       ok: true,
       dir: 'C:\\Users\\example\\.dsh\\memory',
-      files: FILES.map((file) => ({ file, content: '' })),
+      files: FILES.map((file) => ({
+        file,
+        content: '',
+        doc: docs[file] || { title: '', comments: [], preamble: [], groups: [] },
+        entries: [],
+      })),
+      injection: reportFor('rules-must.md'),
       autoCapture: capture,
+    }
+  }
+  if (payload.action === 'saveDoc') {
+    docs[payload.file] = payload.doc
+    return {
+      ok: true,
+      file: payload.file,
+      content: '# 必须遵守\n',
+      doc: payload.doc,
+      entries: [],
+      injection: '已生效：这一节 2 条会整节注入（约 20 字）。',
+      report: Object.assign(reportFor(payload.file), { injectedChars: 20, dropped: 0, sections: [{ file: payload.file, title: '', chars: 20, injectedChars: 20, fitted: 'full', entries: [] }] }),
     }
   }
   if (payload.action === 'modesLoad') return modeReply(payload.sessionId || '')
@@ -574,6 +631,67 @@ check(
   'panel: a goal goes to modeSave with kind=goal',
   sent.some((p) => p.action === 'modeSave' && p.kind === 'goal' && p.name === '光电赛 A 题'),
 )
+
+// ---------- 10.5 the entry editor (0.8.2) ----------
+// A file is no longer one big textarea: every 条 is its own card, so the panel can
+// say which 条 actually made it into the context and which one did not.
+await click(buttonByText('必须遵守'))
+const cards = [...container.querySelectorAll('.umem-entry')]
+check(
+  'panel: a file opens as one card per entry',
+  cards.length === 2 && cards.every((card) => card.querySelector('textarea') !== null),
+  String(cards.length),
+)
+check(
+  'panel: the entry that did not fit is marked, the one that did is not',
+  cards[1].getAttribute('data-fit') === 'dropped' &&
+    cards[1].textContent.includes('这次没进上下文') &&
+    cards[0].getAttribute('data-fit') === 'full',
+  cards.map((card) => card.getAttribute('data-fit')).join(','),
+)
+check('panel: the section meter states how much of it gets in', text().includes('保留 50%'), text().includes('保留 50%') ? 'ok' : 'missing')
+const cardBoxes = [...container.querySelectorAll('.umem-entry textarea')]
+await type(cardBoxes[1], '- 不许写假大空，也不许堆套话。')
+check('panel: editing a card writes nothing yet', sent.every((p) => p.action !== 'saveDoc'))
+await click(buttonByText('保存这一节'))
+check(
+  'panel: 保存 sends the whole doc through saveDoc',
+  sent.some(
+    (p) =>
+      p.action === 'saveDoc' &&
+      p.file === 'rules-must.md' &&
+      p.doc.groups[0].entries[1].text === '- 不许写假大空，也不许堆套话。',
+  ),
+  JSON.stringify(sent.filter((p) => p.action === 'saveDoc')),
+)
+check('panel: the save message is the host injection report', text().includes('已生效：这一节 2 条'))
+check(
+  'panel: after saving, the stale "did not fit" badge is gone',
+  container.querySelectorAll('.umem-entry')[1].getAttribute('data-fit') === 'full',
+)
+
+// ---------- 10.6 设置：隐藏只影响面板，不影响注入 ----------
+await click(buttonByText('设置'))
+const settingsBoxes = [...container.querySelectorAll('.umem-label input[type=checkbox]')]
+check('panel: 设置 lists a checkbox per tab', settingsBoxes.length >= 8, String(settingsBoxes.length))
+check('panel: the settings tab itself cannot be hidden', settingsBoxes.some((box) => box.disabled))
+await click(buttonByText('简洁'))
+check(
+  'panel: the 简洁 preset hides 日志 and the working-set tab',
+  buttonByText('日志') === undefined && buttonByText('临时记忆') === undefined,
+)
+check('panel: 设置 stays reachable after hiding things', buttonByText('设置') !== undefined)
+check(
+  'panel: hiding a tab writes nothing to memory',
+  sent.every((p) => p.action !== 'saveDoc' || p.file !== 'log.md'),
+)
+check(
+  'panel: the choice is remembered in localStorage',
+  (w.localStorage.getItem('dsh-user-memory:ui') || '').includes('log.md'),
+  String(w.localStorage.getItem('dsh-user-memory:ui')),
+)
+await click(buttonByText('全部'))
+check('panel: 全部 brings the hidden tabs back', buttonByText('临时记忆') !== undefined)
 
 // ---------- 11. the composer chip falls back to a select ----------
 // The primitive menu is not resolvable in this test (and may be missing in an

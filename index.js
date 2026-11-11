@@ -242,18 +242,147 @@ const TEMPLATES = {
   ].join('\n'),
 }
 
-/** Drop HTML comments and collapse the blank runs they leave behind. */
-function stripComments(text) {
-  return text
-    .replace(/<!--[\s\S]*?-->/g, '')
-    .replace(/[ \t]+\n/g, '\n')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim()
+/**
+ * Entry model: one memory unit is one top-level `- ` list item (with its
+ * indented continuation lines) or one paragraph block; `## ` starts a group.
+ *
+ * Why this exists: the panel edits memory one entry at a time, so saving a
+ * single line must not rewrite the whole file. `parseDoc` / `composeDoc` are
+ * exact inverses on the files this plugin writes — that round-trip is the
+ * contract, and `test/entry-test.mjs` pins it on the real shapes (headings,
+ * comments, tight bullets, blank runs).
+ */
+const BLANK_LINE = /^\s*$/
+const H1_LINE = /^#\s+/
+const H2_LINE = /^##\s+/
+const BULLET_LINE = /^[-*]\s+/
+
+function parseDoc(text) {
+  const lines = String(text ?? '').replace(/\r\n?/g, '\n').split('\n')
+  const doc = { title: '', comments: [], preamble: [], groups: [] }
+  let i = 0
+  while (i < lines.length && BLANK_LINE.test(lines[i])) i += 1
+  if (i < lines.length && H1_LINE.test(lines[i])) {
+    doc.title = lines[i].replace(H1_LINE, '').trim()
+    i += 1
+  }
+  let group = null
+  const push = (entry) => (group === null ? doc.preamble : group.entries).push(entry)
+  const ensure = () => {
+    if (group === null) doc.groups.push((group = { title: '', entries: [], sep: '\n\n' }))
+  }
+  while (i < lines.length) {
+    let blanks = 0
+    while (i < lines.length && BLANK_LINE.test(lines[i])) {
+      blanks += 1
+      i += 1
+    }
+    if (i >= lines.length) break
+    const sep = '\n'.repeat(blanks + 1)
+    const line = lines[i]
+    if (line.startsWith('<!--')) {
+      const block = [line]
+      i += 1
+      while (i < lines.length && !block[block.length - 1].includes('-->')) block.push(lines[i++])
+      doc.comments.push(block.join('\n'))
+      continue
+    }
+    if (H2_LINE.test(line)) {
+      group = { title: line.replace(H2_LINE, '').trim(), entries: [], sep }
+      doc.groups.push(group)
+      i += 1
+      continue
+    }
+    if (BULLET_LINE.test(line)) {
+      ensure()
+      const block = [line]
+      i += 1
+      while (i < lines.length) {
+        const next = lines[i]
+        if (BLANK_LINE.test(next)) {
+          let j = i + 1
+          while (j < lines.length && BLANK_LINE.test(lines[j])) j += 1
+          // A blank line inside a bullet is only a continuation when the text
+          // that follows is still indented under it.
+          if (j < lines.length && /^\s{2,}\S/.test(lines[j])) {
+            block.push('')
+            i += 1
+            continue
+          }
+          break
+        }
+        if (/^\s+\S/.test(next)) {
+          block.push(next)
+          i += 1
+          continue
+        }
+        break
+      }
+      push({ kind: 'bullet', text: block.join('\n'), sep })
+      continue
+    }
+    ensure()
+    const block = [line]
+    i += 1
+    while (i < lines.length) {
+      const next = lines[i]
+      if (BLANK_LINE.test(next) || H2_LINE.test(next) || BULLET_LINE.test(next) || next.startsWith('<!--')) break
+      block.push(next)
+      i += 1
+    }
+    push({ kind: 'block', text: block.join('\n'), sep })
+  }
+  return doc
 }
 
-/** True when a file still carries real content once headings are removed. */
-function meaningful(body) {
-  return body.replace(/^#{1,6}\s.*$/gm, '').trim()
+function composeDoc(doc) {
+  const parts = []
+  const add = (block, sep) => {
+    if (block === '') return
+    if (parts.length > 0) parts.push(sep)
+    parts.push(block)
+  }
+  if (doc.title) add(`# ${doc.title}`, '\n\n')
+  for (const comment of doc.comments) add(comment, '\n\n')
+  const emit = (entries) => {
+    for (const entry of entries) {
+      const fallback =
+        entry.kind === 'bullet' && parts.length > 0 && parts[parts.length - 1].startsWith('- ') ? '\n' : '\n\n'
+      add(entry.text, entry.sep || fallback)
+    }
+  }
+  emit(doc.preamble)
+  for (const group of doc.groups) {
+    if (group.title) add(`## ${group.title}`, group.sep || '\n\n')
+    emit(group.entries)
+  }
+  return `${parts.join('')}\n`
+}
+
+/** Flatten a doc into its entries, keeping the group each one belongs to. */
+function flattenDoc(doc) {
+  const out = []
+  for (const entry of doc.preamble) out.push({ ...entry, group: '', groupIndex: -1 })
+  doc.groups.forEach((group, groupIndex) => {
+    for (const entry of group.entries) out.push({ ...entry, group: group.title, groupIndex })
+  })
+  return out.map((entry, entryIndex) => ({ ...entry, entryIndex }))
+}
+
+/** Walk a doc as injectable blocks: group headings plus entries. */
+function docBlocks(doc) {
+  const blocks = []
+  let index = 0
+  for (const entry of doc.preamble) {
+    blocks.push({ kind: 'entry', text: entry.text, sep: entry.sep, entryIndex: index++, group: '' })
+  }
+  for (const group of doc.groups) {
+    if (group.title !== '') blocks.push({ kind: 'heading', text: `## ${group.title}`, sep: group.sep })
+    for (const entry of group.entries) {
+      blocks.push({ kind: 'entry', text: entry.text, sep: entry.sep, entryIndex: index++, group: group.title })
+    }
+  }
+  return blocks
 }
 
 /** The conversation an agent belongs to: `Agent.id` IS the session id. */
@@ -274,92 +403,200 @@ function sessionIdOf(agent) {
 function describeInjection(file, content, report) {
   const spec = SECTIONS.find((entry) => entry.file === file)
   if (spec === undefined) return '这个文件不注入（只作为用户自己的记录）。'
-  const body = meaningful(stripComments(content))
-  if (body === '') return '目前这一节是空的（只剩标题或注释），不会注入。'
-  const size = [...body].length
-  if (report === undefined) return `已生效：这一节会注入（约 ${size} 字）。`
-  const total = `目前整块注入约 ${[...report.text].length} / ${report.budget} 字。`
-  // "已生效" is a claim about reaching the model. Say it only when it is true:
-  // promising "约 559 字会注入" for a section the budget cut to 123 字 is the
-  // exact failure this route exists to prevent.
-  const entry = report.sections.find((section) => section.file === file)
-  if (entry === undefined) return `已保存，但预算在前面几节就用完了，这一节这次没有被注入。${total}`
-  if (entry.fitted === 'dropped') return `已保存，但预算已满，这一节这次没有被注入（内容仍然保存了）。${total}`
-  if (entry.fitted === 'partial') {
-    return `已保存，但超出预算：这一节 ${size} 字里只有开头约 ${entry.chars} 字会注入，后面被截掉了。${total}`
+  const entries = flattenDoc(parseDoc(content)).filter((entry) => entry.text.trim() !== '')
+  if (entries.length === 0) return '目前这一节是空的（只剩标题或注释），不会注入。'
+  const size = entries.reduce((sum, entry) => sum + [...entry.text].length, 0)
+  const count = entries.length
+  if (report === undefined) return `已生效：这一节会注入（约 ${size} 字，${count} 条）。`
+  const share = report.totalChars === 0 ? 100 : Math.round((report.injectedChars / report.totalChars) * 100)
+  const total =
+    `目前整块注入约 ${report.injectedChars} 字：记忆共 ${report.totalChars} 字，` +
+    `保留 ${share}%；预算 ${report.budget} 字。`
+  const section = report.sections.find((item) => item.file === file)
+  if (section === undefined) return `已保存，但预算在前面几节就用完了，这一节这次没有被注入。${total}`
+  if (section.fitted === 'dropped') {
+    return `已保存，但预算已满，这一节 ${count} 条这次全部没有注入（内容仍然保存在文件里）。${total}`
   }
-  return `已生效：这一节会注入（约 ${size} 字）。${total}`
+  if (section.fitted === 'partial') {
+    const missing = section.entries.filter((entry) => entry.fitted !== 'full').length
+    return `已保存，但超出预算：这一节 ${count} 条里有 ${missing} 条这次没有注入（内容仍然保存在文件里）。${total}`
+  }
+  return `已生效：这一节 ${count} 条会整节注入（约 ${size} 字）。${total}`
 }
 
 /**
- * Appended when a section does not fit; its length is part of the budget.
- *
- * The path matters: "完整内容见记忆目录" cannot be acted on by a model that was
- * never told where the directory is. It is the fallback form only, used when the
- * full notice would leave too little room to inject anything at all.
+ * The subset of a render report the panel needs: per-entry outcomes for the
+ * "which memory did not make it" badges, and the totals for the distortion meter.
  */
-const SHORT_TRUNCATION_NOTICE = '\n\n…（本段超出预算已截断，完整内容见记忆目录）'
+function panelReport(report) {
+  if (report === undefined) return undefined
+  return {
+    budget: report.budget,
+    totalChars: report.totalChars,
+    injectedChars: report.injectedChars,
+    dropped: report.dropped,
+    sections: report.sections.map((section) => ({
+      file: section.file,
+      title: section.title,
+      chars: section.chars,
+      injectedChars: section.injectedChars,
+      fitted: section.fitted,
+      entries: section.entries,
+    })),
+  }
+}
 
-function truncationNotice(dir) {
-  return dir === undefined || dir === ''
-    ? SHORT_TRUNCATION_NOTICE
-    : `\n\n…（本段超出预算已截断，完整内容见 ${dir}）`
+/**
+ * Accept a doc from the panel and rebuild only the fields this plugin writes.
+ * The doc is user data, not a trusted shape: every string is re-typed here, so a
+ * malformed payload cannot smuggle odd values into the markdown.
+ */
+function normalizeDoc(input) {
+  const text = (value, limit) => (typeof value === 'string' ? value.slice(0, limit) : '')
+  const entry = (value) => ({
+    kind: value?.kind === 'bullet' ? 'bullet' : 'block',
+    text: text(value?.text, MAX_CONTENT_BYTES),
+    sep: /^\n+$/.test(text(value?.sep, 8)) ? value.sep : undefined,
+  })
+  if (input === null || typeof input !== 'object') return undefined
+  return {
+    title: text(input.title, 200),
+    comments: Array.isArray(input.comments) ? input.comments.slice(0, 50).map((item) => text(item, 4000)) : [],
+    preamble: Array.isArray(input.preamble) ? input.preamble.slice(0, 500).map(entry) : [],
+    groups: Array.isArray(input.groups)
+      ? input.groups.slice(0, 200).map((group) => ({
+          title: text(group?.title, 200),
+          sep: /^\n+$/.test(text(group?.sep, 8)) ? group.sep : undefined,
+          entries: Array.isArray(group?.entries) ? group.entries.slice(0, 500).map(entry) : [],
+        }))
+      : [],
+  }
 }
 
 /**
  * Compose the injected block. `maxChars` bounds the whole block, preamble and
  * notice included.
  *
- * Returns the text plus what happened to each section (`full` / `partial` /
- * `dropped`): "did this section actually reach the model" cannot be recovered
- * from the string afterwards, and the panel has to report it truthfully.
+ * Entries are packed **whole**: a memory that does not fit is left out and named,
+ * never cut mid-sentence — half a rule is worse than a visible gap. Only a single
+ * entry longer than the entire budget is trimmed, and that one reports `partial`.
+ *
+ * Returns the text plus what happened to each entry (`full` / `partial` /
+ * `dropped`): "did this memory actually reach the model" cannot be recovered from
+ * the string afterwards, and the panel has to report it truthfully.
  */
 function render(parts, maxChars, dir) {
-  const report = { text: '', budget: maxChars, sections: [] }
-  if (parts.length === 0) return report
+  const report = { text: '', budget: maxChars, totalChars: 0, injectedChars: 0, dropped: 0, sections: [] }
+  const atoms = []
+  let used = 0
   const budget = maxChars - PREAMBLE.length - 2
-  if (budget <= 0) return report
-  let body = ''
-  let index = 0
-  for (; index < parts.length; index += 1) {
-    const part = parts[index]
-    const chunk = `\n\n### ${part.title}\n\n${part.body}`
-    if (body.length + chunk.length <= budget) {
-      body += chunk
-      report.sections.push({ file: part.file, chars: part.body.length, fitted: 'full' })
-      continue
-    }
-    // Prefer the notice carrying the path; a tiny budget that cannot afford it
-    // still gets the old short one, so truncation stays announced either way.
-    let notice = truncationNotice(dir)
-    let room = budget - body.length - notice.length
-    if (room < 120) {
-      notice = SHORT_TRUNCATION_NOTICE
-      room = budget - body.length - notice.length
-    }
-    if (room >= 120) {
-      body += chunk.slice(0, room) + notice
-      report.sections.push({ file: part.file, chars: room, fitted: 'partial' })
-      index += 1
-    }
-    break
+  const push = (atom) => {
+    atoms.push(atom)
+    used += atom.text.length + atom.sep.length
   }
-  for (; index < parts.length; index += 1) {
-    report.sections.push({ file: parts[index].file, chars: 0, fitted: 'dropped' })
+  parts.forEach((part, index) => {
+    const section = { file: part.file, title: part.title, chars: 0, injectedChars: 0, fitted: 'full', entries: [] }
+    report.sections.push(section)
+    for (const block of part.blocks) if (block.kind === 'entry') report.totalChars += [...block.text].length
+    let started = false
+    const headerCost = `\n\n### ${part.title}\n\n`.length
+    for (const block of part.blocks) {
+      // The section header already ends with a blank line, so the first block
+      // must not add its own separator again (that used to leave a double gap).
+      const sep = started ? block.sep || '\n\n' : ''
+      const size = block.kind === 'entry' ? [...block.text].length : 0
+      const header = started ? 0 : headerCost
+      if (budget > 0 && used + header + sep.length + size <= budget) {
+        if (!started) {
+          started = true
+          push({ kind: 'section', section: index, text: `\n\n### ${part.title}\n\n`, sep: '' })
+        }
+        if (block.kind === 'entry') {
+          push({ kind: 'entry', section: index, text: block.text, sep, entryIndex: block.entryIndex, size })
+          section.entries.push({ entryIndex: block.entryIndex, chars: size, fitted: 'full' })
+        } else {
+          push({ kind: 'heading', section: index, text: block.text, sep })
+        }
+        continue
+      }
+      if (block.kind === 'entry') section.entries.push({ entryIndex: block.entryIndex, chars: size, fitted: 'dropped' })
+    }
+  })
+  const recount = () => {
+    report.dropped = 0
+    for (const section of report.sections) {
+      for (const entry of section.entries) if (entry.fitted !== 'full') report.dropped += 1
+    }
   }
-  report.text = body.length === 0 ? '' : PREAMBLE + body
+  recount()
+  let text = joinAtoms(atoms)
+  if (report.dropped > 0 && budget > 0) {
+    // Make the gap visible without stealing room from the memories that fit:
+    // evict the last entries (never a heading) until the notice fits.
+    const noticeText = () =>
+      `\n\n…（另有 ${report.dropped} 条记忆这次没有进上下文，全文见 ${dir || '记忆目录'}）`
+    let notice = noticeText()
+    while (text.length + notice.length > budget && evictLastEntry(atoms, report.sections)) {
+      recount()
+      text = joinAtoms(atoms)
+      notice = noticeText()
+    }
+    if (text.length + notice.length > budget) notice = '\n\n…（部分记忆没有进上下文）'
+    if (text.length + notice.length <= budget) text += notice
+  }
+  for (const section of report.sections) {
+    section.chars = section.entries.reduce((sum, entry) => sum + entry.chars, 0)
+    section.injectedChars = section.entries
+      .filter((entry) => entry.fitted === 'full')
+      .reduce((sum, entry) => sum + entry.chars, 0)
+    if (!section.entries.some((entry) => entry.fitted === 'full')) section.fitted = 'dropped'
+    else if (section.entries.some((entry) => entry.fitted !== 'full')) section.fitted = 'partial'
+    else section.fitted = 'full'
+  }
+  report.injectedChars = report.sections.reduce((sum, section) => sum + section.injectedChars, 0)
+  report.text = text.length === 0 ? '' : PREAMBLE + text
   return report
 }
 
-/**
- * Appended to the injected block only while `autoCapture` is on.
- *
- * Two hard constraints ride on this constant:
- *  1. it is CONSTANT — nothing from the conversation may be interpolated, or the
- *     prompt would change every turn and prompt caching would be lost;
- *  2. it sits OUTSIDE `maxChars`, so the user's own text keeps its full budget.
- * A disabled switch appends `''`, leaving the prompt byte-identical.
- */
+function joinAtoms(atoms) {
+  let out = ''
+  for (const atom of atoms) {
+    if (out !== '' && atom.sep !== '') out += atom.sep
+    out += atom.text
+  }
+  return out
+}
+
+/** Drop the last included entry; returns false when nothing is left to drop. */
+function evictLastEntry(atoms, sections) {
+  let index = -1
+  for (let i = atoms.length - 1; i >= 0; i -= 1) {
+    if (atoms[i].kind === 'entry') {
+      index = i
+      break
+    }
+  }
+  if (index < 0) return false
+  const [atom] = atoms.splice(index, 1)
+  const section = sections[atom.section]
+  const entry = section.entries.find((item) => item.entryIndex === atom.entryIndex)
+  if (entry !== undefined) {
+    entry.fitted = 'dropped'
+    entry.chars = atom.size
+  }
+  const stillHasEntry = atoms.some((item) => item.section === atom.section && item.kind === 'entry')
+  if (!stillHasEntry) {
+    // Keep no orphan heading behind: the section's framing goes with its last entry.
+    for (let i = atoms.length - 1; i >= 0; i -= 1) {
+      if (atoms[i].section === atom.section) atoms.splice(i, 1)
+    }
+    section.fitted = 'dropped'
+  } else {
+    section.fitted = 'partial'
+  }
+  return true
+}
+
 // ---- 临时记忆：注入时怎么渲染 -------------------------------------------------
 
 /** The block header. Constant text: it must never depend on the entries. */
@@ -1147,6 +1384,9 @@ export async function apply(ctx, config = {}) {
   // What the last `render()` did to each section; the save reply reads it, so a
   // truncated or dropped section is never described as "injected".
   let lastReport
+  // Parsed form of each file as of the last reload: the panel edits entries, and
+  // re-parsing client-side would be a second implementation of the same grammar.
+  let lastDocs = new Map()
 
   // Reads the files and republishes `text`. Never called concurrently with
   // itself: `refresh` guards it, and the switch action awaits it directly.
@@ -1154,10 +1394,13 @@ export async function apply(ctx, config = {}) {
     switchState = await readSwitch()
     autoCapture = switchState === null ? configAutoCapture : switchState
     const parts = []
+    lastDocs = new Map()
     for (const spec of SECTIONS) {
       const raw = await readFile(join(dir, spec.file), 'utf8').catch(() => '')
-      const body = stripComments(raw)
-      if (meaningful(body)) parts.push({ file: spec.file, title: spec.title, body })
+      const doc = parseDoc(raw)
+      lastDocs.set(spec.file, doc)
+      const blocks = docBlocks(doc)
+      if (blocks.some((block) => block.kind === 'entry')) parts.push({ file: spec.file, title: spec.title, blocks })
     }
     lastReport = render(parts, maxChars, dir)
     text = lastReport.text + (autoCapture ? AUTO_CAPTURE_NOTICE : '')
@@ -1298,12 +1541,14 @@ export async function apply(ctx, config = {}) {
       const files = []
       for (const file of EDITABLE_FILES) {
         const content = await readFile(join(dir, file), 'utf8').catch(() => '')
-        files.push({ file, content })
+        const doc = lastDocs.get(file) ?? parseDoc(content)
+        files.push({ file, content, doc, entries: flattenDoc(doc).length })
       }
       return Response.json({
         ok: true,
         dir,
         files,
+        injection: panelReport(lastReport),
         suggestFile: suggestPath,
         // `source` tells the panel WHY the switch reads the way it does, so a
         // profile that turned it on in the config is not displayed as "off".
@@ -1642,6 +1887,39 @@ export async function apply(ctx, config = {}) {
         return Response.json({ ok: false, error: '写入失败，请查看日志' }, { status: 500 })
       }
       return Response.json(modesPayload(sessionId))
+    }
+
+    // Entry-level save: the panel edits one memory at a time and sends the whole
+    // doc back. Serialising here (not in the client) keeps one grammar, the one
+    // `parseDoc` already proved byte-exact against the files on disk.
+    if (action === 'saveDoc') {
+      const file = payload?.file
+      if (typeof file !== 'string' || !EDITABLE_FILES.includes(file)) {
+        return Response.json({ ok: false, error: '不允许的文件名' }, { status: 400 })
+      }
+      const doc = normalizeDoc(payload?.doc)
+      if (doc === undefined) return Response.json({ ok: false, error: '内容格式不对' }, { status: 400 })
+      const content = composeDoc(doc)
+      if (Buffer.byteLength(content, 'utf8') > MAX_CONTENT_BYTES) {
+        return Response.json({ ok: false, error: '内容过大，已拒绝保存' }, { status: 413 })
+      }
+      try {
+        await mkdir(dir, { recursive: true })
+        await writeFile(join(dir, file), content, 'utf8')
+      } catch (error) {
+        ctx.logger?.warn?.(`user-memory: save failed for ${file}: ${String(error)}`)
+        return Response.json({ ok: false, error: '写入失败，请查看日志' }, { status: 500 })
+      }
+      await refresh()
+      return Response.json({
+        ok: true,
+        file,
+        content,
+        doc: lastDocs.get(file) ?? parseDoc(content),
+        entries: flattenDoc(parseDoc(content)).length,
+        injection: describeInjection(file, content, lastReport),
+        report: panelReport(lastReport),
+      })
     }
 
     if (action === 'save') {

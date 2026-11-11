@@ -36,6 +36,56 @@ window.__ModuleLoader__.load({
     // reopened panel does not silently jump back to the first file.
     const DEFAULT_TAB = TEMP_KEY;
     const ACTIVE_TAB_KEY = 'dsh-user-memory:active-tab';
+    // 面板显隐设置（0.8.2）。只影响面板看不看得到，绝不影响注入——隐藏一个
+    // 标签页不等于把它从上下文里拿掉，这条边界写在设置页上，也写进 README。
+    const SETTINGS_KEY = '__settings__';
+    const UI_KEY = 'dsh-user-memory:ui';
+    const PRESETS = [
+      { id: 'all', title: '全部', hidden: [] },
+      { id: 'simple', title: '简洁', hidden: ['log.md', MODES_KEY, TEMP_KEY] },
+      { id: 'work', title: '工作', hidden: ['log.md'] },
+      { id: 'game', title: '游戏', hidden: ['log.md', 'rules-must.md', 'agent.md', 'rules-should.md'] },
+    ];
+    const readUi = () => {
+      try {
+        const raw = window.localStorage.getItem(UI_KEY);
+        const parsed = raw === null ? null : JSON.parse(raw);
+        if (parsed && Array.isArray(parsed.hidden)) {
+          return { hidden: parsed.hidden.filter((value) => typeof value === 'string'), preset: typeof parsed.preset === 'string' ? parsed.preset : 'custom' };
+        }
+      } catch (error) {
+        /* no storage: every tab stays visible */
+      }
+      return { hidden: [], preset: 'all' };
+    };
+    const writeUi = (ui) => {
+      try {
+        window.localStorage.setItem(UI_KEY, JSON.stringify(ui));
+      } catch (error) {
+        /* no storage: the setting lasts for this session only */
+      }
+    };
+
+    // 条目模型的客户端一半：服务端 parseDoc 产出的结构，面板只做局部改写，保存时
+    // 整份 doc 发回去由 composeDoc 重新串成 markdown（逐字节可逆，手改的记录文件
+    // 不会因为面板保存而被整体重排）。全局 entryIndex 的口径与服务端 flattenDoc
+    // 一致：先 preamble 的段落，再按组顺序的条目。
+    const emptyDoc = () => ({ title: '', comments: [], preamble: [], groups: [] });
+    const cloneDoc = (doc) => JSON.parse(JSON.stringify(doc || emptyDoc()));
+    const docSignature = (doc) => (doc ? JSON.stringify(doc) : '');
+    const entryLists = (doc) => [doc.preamble || []].concat((doc.groups || []).map((group) => group.entries || []));
+    function entryAt(doc, index) {
+      let rest = index;
+      for (const list of entryLists(doc)) {
+        if (rest < list.length) return { list: list, at: rest };
+        rest -= list.length;
+      }
+      return null;
+    }
+    const entryCount = (doc) => entryLists(doc).reduce((sum, list) => sum + list.length, 0);
+    // 设置页永远可见：它是把别的页重新放出来的唯一入口。
+    const isKnownVisible = (tab, hidden) => tab === SETTINGS_KEY || hidden.indexOf(tab) < 0;
+
     // The two chip slots' registry ids and orders. Workflow sits left of the goal
     // because it is the one with a default and the one picked in most sessions.
     const WORKFLOW_CHIP_ID = 'user-memory-workflow';
@@ -66,6 +116,7 @@ window.__ModuleLoader__.load({
       },
       { file: MODES_KEY, title: '工作流 / 目标', hint: '这里写多套工作流和短期目标，会话里用输入框上方的两个小按钮选；工作流可设默认，短期目标不选就不注入' },
       { file: PENDING_KEY, title: '待确认', hint: 'AI 提议，用户点「采纳」才会写进记忆；采纳后到 AI 下一轮开跑之前可以撤销' },
+      { file: SETTINGS_KEY, title: '设置', hint: '标签页显隐与预设。只改变面板看不看得到，不影响注入——藏起来的记忆照样会进上下文' },
     ]);
 
     // localStorage may be missing or throw (private mode, embedded webview), and
@@ -100,10 +151,33 @@ window.__ModuleLoader__.load({
       '.umem-tab:hover{background:var(--dsw-alias-interactive-hover);}',
       '.umem-tab[data-on="1"]{background:var(--dsw-alias-interactive-selected);color:var(--dsw-alias-label-primary);border-color:var(--dsw-alias-border-l1);}',
       '.umem-dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--dsw-alias-state-warn-primary);margin-left:6px;vertical-align:middle;}',
+      '.umem-cut{display:inline-flex;align-items:center;justify-content:center;min-width:14px;height:14px;border-radius:7px;background:var(--dsw-alias-state-warn-primary);color:var(--dsw-alias-bg-base);font-size:10px;font-weight:700;margin-left:4px;line-height:1;}',
       '.umem-hintbar{padding:8px 24px 0;font-size:12px;color:var(--dsw-alias-label-tertiary);}',
       '.umem-body{flex:1;min-height:0;padding:10px 24px;display:flex;}',
       '.umem-editor{flex:1;min-height:0;width:100%;box-sizing:border-box;resize:none;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);padding:12px 14px;font-family:ui-monospace,Consolas,"Courier New",monospace;font-size:13px;line-height:1.65;}',
       '.umem-editor:focus{outline:none;border-color:var(--dsw-alias-brand-primary);}',
+      '.umem-entries{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:10px;padding-bottom:8px;}',
+      '.umem-group{border:1px solid var(--dsw-alias-border-l1);border-radius:10px;padding:10px;display:flex;flex-direction:column;gap:8px;background:var(--dsw-alias-bg-layer-1);}',
+      '.umem-grouphead{display:flex;gap:8px;align-items:center;}',
+      '.umem-gtitle{flex:1;font-weight:600;font-size:13px;background:transparent;border:none;color:inherit;padding:2px 4px;border-radius:6px;font-family:inherit;}',
+      '.umem-gtitle:focus{outline:1px solid var(--dsw-alias-brand-primary);}',
+      '.umem-entry{border:1px solid var(--dsw-alias-border-l1);border-radius:8px;padding:6px 8px;background:var(--dsw-alias-bg-base);}',
+      '.umem-entry[data-fit="dropped"]{border-color:var(--dsw-alias-state-warn-primary);}',
+      '.umem-entry[data-fit="partial"]{border-color:var(--dsw-alias-state-warn-primary);}',
+      '.umem-entryhead{display:flex;align-items:center;gap:8px;font-size:11px;color:var(--dsw-alias-label-tertiary);margin-bottom:2px;}',
+      '.umem-entry textarea{width:100%;box-sizing:border-box;border:none;background:transparent;color:inherit;font:inherit;font-size:13px;line-height:1.55;resize:vertical;min-height:34px;padding:0;}',
+      '.umem-entry textarea:focus{outline:none;}',
+      '.umem-chip{font-size:11px;padding:1px 6px;border-radius:6px;border:1px solid var(--dsw-alias-border-l1);}',
+      '.umem-chip[data-kind="warn"]{color:var(--dsw-alias-state-warn-primary);border-color:var(--dsw-alias-state-warn-primary);}',
+      '.umem-chip[data-kind="ok"]{color:var(--dsw-alias-state-success-primary);}',
+      '.umem-mini{font-size:11px;padding:2px 8px;border-radius:6px;border:1px solid var(--dsw-alias-border-l1);background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer;font-family:inherit;}',
+      '.umem-mini:hover{background:var(--dsw-alias-interactive-hover);}',
+      '.umem-meter{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--dsw-alias-label-secondary);}',
+      '.umem-meterbar{width:110px;height:6px;border-radius:3px;background:var(--dsw-alias-border-l1);overflow:hidden;}',
+      '.umem-meterfill{height:100%;background:var(--dsw-alias-state-success-primary);}',
+      '.umem-settings{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:14px;max-width:680px;}',
+      '.umem-label{display:flex;align-items:center;gap:8px;font-size:13px;}',
+      '.umem-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}',
       '.umem-foot{display:flex;align-items:center;gap:12px;padding:0 24px 18px;flex-wrap:wrap;}',
       '.umem-btn{border:1px solid var(--dsw-alias-border-l1);border-radius:8px;padding:7px 16px;font-size:13px;font-family:inherit;cursor:pointer;background:var(--dsw-specific-button-secondary-fill);color:var(--dsw-alias-label-primary);}',
       '.umem-btn:hover:not(:disabled){background:var(--dsw-specific-button-secondary-fill-hover);}',
@@ -312,8 +386,14 @@ window.__ModuleLoader__.load({
     function Panel() {
       const [status, setStatus] = useState('loading');
       const [dir, setDir] = useState('');
-      const [saved, setSaved] = useState({});
-      const [drafts, setDrafts] = useState({});
+      // 0.8.2：文件不再是一个大文本框，而是「组 + 条目」。`docs` 是工作副本，
+      // `savedJson` 是上次落盘时的快照（比较 JSON 就够判断未保存，「放弃改动」
+      // 也只需要把 docs 换回saved 的那一份）。
+      const [docs, setDocs] = useState({});
+      const [savedDocs, setSavedDocs] = useState({});
+      // 上一次 render() 的结果：哪一条进了上下文、哪一条没进。失真度提示全靠它。
+      const [report, setReport] = useState(null);
+      const [ui, setUi] = useState(readUi);
       const [active, setActive] = useState(readActiveTab);
       const [message, setMessage] = useState(null);
       const [saving, setSaving] = useState(false);
@@ -362,10 +442,16 @@ window.__ModuleLoader__.load({
         try {
           const data = await call('load');
           if (!data || data.ok !== true) throw new Error((data && data.error) || '读取失败');
-          const map = {};
-          for (const entry of data.files) map[entry.file] = entry.content;
-          setSaved(map);
-          setDrafts(map);
+          const docMap = {};
+          const savedMap = {};
+          for (const entry of data.files) {
+            const doc = entry.doc || { title: '', comments: [], preamble: [], groups: [] };
+            docMap[entry.file] = doc;
+            savedMap[entry.file] = JSON.stringify(doc);
+          }
+          setDocs(docMap);
+          setSavedDocs(savedMap);
+          setReport(data.injection || null);
           setDir(data.dir || '');
           setCapture(
             data.autoCapture && typeof data.autoCapture.on === 'boolean'
@@ -462,7 +548,22 @@ window.__ModuleLoader__.load({
         [tempKnown, tempEnabled, active],
       );
 
-      const dirty = FILES.some((entry) => (drafts[entry.file] || '') !== (saved[entry.file] || ''));
+      const dirty = FILES.some((entry) => docSignature(docs[entry.file]) !== (savedDocs[entry.file] || ''));
+
+      // 视图设置：藏起来的标签页只是不画出来，文件照旧加载、照旧注入。设置页
+      // 本身永远可见，否则一旦把入口藏了就没有地方改回来。
+      const visibleTabs = TABS.filter(
+        (entry) => entry.file === SETTINGS_KEY || ui.hidden.indexOf(entry.file) < 0,
+      );
+      useEffect(
+        function () {
+          if (isKnownVisible(active, ui.hidden)) return;
+          const fallback = visibleTabs.length > 0 ? visibleTabs[0].file : SETTINGS_KEY;
+          setActive(fallback);
+          writeActiveTab(fallback);
+        },
+        [active, ui.hidden],
+      );
 
       // The switch is the only control that must act the moment it is clicked:
       // it writes the state file on the host and the host re-publishes the
@@ -491,13 +592,20 @@ window.__ModuleLoader__.load({
         setSaving(true);
         setMessage(null);
         try {
-          const data = await call('save', { file: active, content: drafts[active] || '' });
+          const data = await call('saveDoc', { file: active, doc: docs[active] });
           if (!data || data.ok !== true) throw new Error((data && data.error) || '保存失败');
-          setSaved(function (prev) {
+          const doc = data.doc || docs[active];
+          setDocs(function (prev) {
             const next = Object.assign({}, prev);
-            next[active] = drafts[active] || '';
+            next[active] = doc;
             return next;
           });
+          setSavedDocs(function (prev) {
+            const next = Object.assign({}, prev);
+            next[active] = JSON.stringify(doc);
+            return next;
+          });
+          if (data.report) setReport(data.report);
           setMessage({ kind: 'ok', text: '已保存。' + (data.injection || '') });
         } catch (error) {
           setMessage({
@@ -507,7 +615,7 @@ window.__ModuleLoader__.load({
         } finally {
           setSaving(false);
         }
-      }, [active, drafts]);
+      }, [active, docs]);
 
       // The one action the model can never take: deciding.
       const resolve = useCallback(
@@ -746,12 +854,13 @@ window.__ModuleLoader__.load({
       const isPending = active === PENDING_KEY;
       const isTemp = active === TEMP_KEY;
       const isModes = active === MODES_KEY;
-      // 三个伪标签页背后都没有文件：没有编辑器，也没有「未保存」可言。
-      const isPseudo = isPending || isTemp || isModes;
+      const isSettings = active === SETTINGS_KEY;
+      // 四个伪标签页背后都没有记忆文件：没有编辑器，也没有「未保存」可言。
+      const isPseudo = isPending || isTemp || isModes || isSettings;
       const current = isPseudo
         ? TABS.find((entry) => entry.file === active) || TABS[TABS.length - 1]
         : FILES.find((entry) => entry.file === active) || FILES[0];
-      const isDirty = isPseudo ? false : (drafts[active] || '') !== (saved[active] || '');
+      const isDirty = isPseudo ? false : docSignature(docs[active]) !== (savedDocs[active] || '');
       const waiting = suggestions.filter((item) => item.status === 'pending').length;
       const tempOpen = temps.filter((item) => item.status === 'open').length;
 
@@ -1304,6 +1413,281 @@ window.__ModuleLoader__.load({
         );
       }
 
+      // ---- 0.8.2：条目编辑器 -------------------------------------------------
+      // 一份 doc 就是这一节的全部内容。编辑只改 doc（局部），保存时整份发回服务端
+      // 重新 compose，所以面板永远不会把用户手写的记录文件重排。
+      const activeDoc = docs[active] || null;
+      const sectionReport =
+        report && Array.isArray(report.sections)
+          ? report.sections.find(function (item) {
+              return item.file === active;
+            }) || null
+          : null;
+
+      // 有未保存改动时不显示「未注入」：那份 report 描述的是磁盘上的旧内容，拿它
+      // 标新编辑的条目会撒谎。保存成功后 report 会刷新。
+      const fitOf = function (index) {
+        if (isDirty || !sectionReport || !Array.isArray(sectionReport.entries)) return 'full';
+        const hit = sectionReport.entries.find(function (item) {
+          return item.entryIndex === index;
+        });
+        return hit ? hit.fitted : 'full';
+      };
+
+      const editDoc = function (mutator) {
+        setDocs(function (prev) {
+          const next = Object.assign({}, prev);
+          const doc = cloneDoc(prev[active]);
+          mutator(doc);
+          next[active] = doc;
+          return next;
+        });
+      };
+
+      const newEntry = function (list) {
+        const prev = list.length > 0 ? list[list.length - 1] : null;
+        return {
+          kind: 'bullet',
+          text: '新的一条记忆',
+          sep: prev && prev.kind === 'bullet' ? '\n' : '\n\n',
+        };
+      };
+
+      const entryCard = function (entry, index) {
+        const fit = fitOf(index);
+        const size = Array.from(String(entry.text || '')).length;
+        const lines = String(entry.text || '').split('\n').length;
+        return h(
+          'div',
+          { key: 'entry-' + index, className: 'umem-entry', 'data-fit': fit },
+          h(
+            'div',
+            { className: 'umem-entryhead' },
+            h('span', null, '#' + (index + 1)),
+            fit === 'dropped'
+              ? h('span', { className: 'umem-chip', 'data-kind': 'warn' }, '这次没进上下文')
+              : null,
+            h('span', null, size + ' 字'),
+            h('span', { style: { flex: 1 } }),
+            h(
+              'button',
+              {
+                className: 'umem-mini',
+                onClick: function () {
+                  editDoc(function (doc) {
+                    const hit = entryAt(doc, index);
+                    if (hit) hit.list.splice(hit.at, 1);
+                  });
+                },
+              },
+              '删除',
+            ),
+          ),
+          h('textarea', {
+            spellCheck: false,
+            rows: Math.min(16, Math.max(2, lines)),
+            value: entry.text || '',
+            onChange: function (event) {
+              const value = event.target.value;
+              editDoc(function (doc) {
+                const hit = entryAt(doc, index);
+                if (hit) hit.list[hit.at].text = value;
+              });
+            },
+          }),
+        );
+      };
+
+      function entryArea() {
+        if (!activeDoc) {
+          return h('div', { className: 'umem-center' }, h('div', null, '读取中…'));
+        }
+        const indexRef = { value: 0 };
+        const cards = [];
+        const preamble = activeDoc.preamble || [];
+        preamble.forEach(function (entry) {
+          cards.push(entryCard(entry, indexRef.value));
+          indexRef.value += 1;
+        });
+        (activeDoc.groups || []).forEach(function (group, groupIndex) {
+          const groupCards = [];
+          (group.entries || []).forEach(function (entry) {
+            groupCards.push(entryCard(entry, indexRef.value));
+            indexRef.value += 1;
+          });
+          cards.push(
+            h(
+              'div',
+              { key: 'group-' + groupIndex, className: 'umem-group' },
+              h(
+                'div',
+                { className: 'umem-grouphead' },
+                h('input', {
+                  className: 'umem-gtitle',
+                  spellCheck: false,
+                  value: group.title || '',
+                  placeholder: '组名（## 行）',
+                  onChange: function (event) {
+                    const value = event.target.value;
+                    editDoc(function (doc) {
+                      doc.groups[groupIndex].title = value;
+                    });
+                  },
+                }),
+                h(
+                  'button',
+                  {
+                    className: 'umem-mini',
+                    onClick: function () {
+                      editDoc(function (doc) {
+                        doc.groups.splice(groupIndex, 1);
+                      });
+                    },
+                  },
+                  '删掉这组',
+                ),
+              ),
+              groupCards,
+              h(
+                'button',
+                {
+                  className: 'umem-mini',
+                  onClick: function () {
+                    editDoc(function (doc) {
+                      doc.groups[groupIndex].entries.push(newEntry(doc.groups[groupIndex].entries));
+                    });
+                  },
+                },
+                '＋ 这一组再加一条',
+              ),
+            ),
+          );
+        });
+        const total = sectionReport ? sectionReport.chars : null;
+        const got = sectionReport ? sectionReport.injectedChars : null;
+        const percent = total ? Math.round((got / total) * 100) : null;
+        return h(
+          'div',
+          { className: 'umem-entries' },
+          sectionReport && !isDirty
+            ? h(
+                'div',
+                { className: 'umem-meter' },
+                sectionReport.fitted === 'full'
+                  ? '这一节 ' + sectionReport.entries.length + ' 条全部会进上下文（' + got + ' / ' + total + ' 字）'
+                  : '这一节 ' + sectionReport.entries.length + ' 条里只有部分进上下文（' + got + ' / ' + total + ' 字，保留 ' + percent + '%）',
+                h(
+                  'div',
+                  { className: 'umem-meterbar' },
+                  h('div', {
+                    className: 'umem-meterfill',
+                    style: { width: Math.max(2, Math.min(100, percent || 0)) + '%' },
+                  }),
+                ),
+              )
+            : null,
+          h('input', {
+            className: 'umem-gtitle',
+            style: { fontSize: '15px' },
+            spellCheck: false,
+            value: activeDoc.title || '',
+            placeholder: '文件标题（# 行，不注入给 AI）',
+            onChange: function (event) {
+              const value = event.target.value;
+              editDoc(function (doc) {
+                doc.title = value;
+              });
+            },
+          }),
+          cards,
+          h(
+            'button',
+            {
+              className: 'umem-mini',
+              style: { alignSelf: 'flex-start' },
+              onClick: function () {
+                editDoc(function (doc) {
+                  const entries = [];
+                  entries.push(newEntry(entries));
+                  doc.groups.push({ title: '新的一组', entries: entries, sep: '\n\n' });
+                });
+              },
+            },
+            '＋ 新增一组',
+          ),
+        );
+      }
+
+      function settingsArea() {
+        const apply = function (hidden, preset) {
+          const next = { hidden: hidden.slice(), preset: preset };
+          setUi(next);
+          writeUi(next);
+          setMessage(null);
+        };
+        return h(
+          'div',
+          { className: 'umem-settings' },
+          h('div', { className: 'umem-sectitle' }, '预设'),
+          h(
+            'div',
+            { className: 'umem-row' },
+            PRESETS.map(function (preset) {
+              return h(
+                'button',
+                {
+                  key: preset.id,
+                  className: 'umem-btn',
+                  'data-on': ui.preset === preset.id ? '1' : '0',
+                  onClick: function () {
+                    apply(preset.hidden, preset.id);
+                  },
+                },
+                preset.title,
+              );
+            }),
+          ),
+          h(
+            'div',
+            { className: 'umem-msg' },
+            '预设只是把下面的勾选一次填好；勾完还可以单独改，改过就记为「自定义」。',
+          ),
+          h('div', { className: 'umem-sectitle' }, '标签页'),
+          TABS.map(function (entry) {
+            const locked = entry.file === SETTINGS_KEY;
+            const shown = locked || ui.hidden.indexOf(entry.file) < 0;
+            return h(
+              'label',
+              { key: entry.file, className: 'umem-label' },
+              h('input', {
+                type: 'checkbox',
+                checked: shown,
+                disabled: locked,
+                onChange: function (event) {
+                  const nextHidden = ui.hidden.filter(function (file) {
+                    return file !== entry.file;
+                  });
+                  if (!event.target.checked) nextHidden.push(entry.file);
+                  apply(nextHidden, 'custom');
+                },
+              }),
+              entry.title,
+              h('span', { className: 'umem-sub' }, locked ? '（永远可见）' : entry.file),
+            );
+          }),
+          h(
+            'div',
+            { className: 'umem-msg' },
+            '隐藏只影响面板看不看得到，不影响注入：藏起来的记忆照样每轮都会进上下文。要让它真的不注入，只能改文件内容。',
+          ),
+          h(
+            'div',
+            { className: 'umem-arch' },
+            '设置存在浏览器 localStorage（' + UI_KEY + '），不写记忆目录，也不进上下文，换台机器就回到默认。',
+          ),
+        );
+      }
+
       return h(
         'div',
         { className: 'umem-root' },
@@ -1312,7 +1696,16 @@ window.__ModuleLoader__.load({
           'div',
           { className: 'umem-head' },
           h('div', { className: 'umem-title' }, '多功能记忆'),
-          h('div', { className: 'umem-sub' }, '文件位置：' + (dir || '（未知）')),
+          h(
+            'div',
+            { className: 'umem-sub' },
+            '文件位置：' + (dir || '（未知）') +
+              (report
+                ? '　|　整块注入 ' + report.injectedChars + ' / ' + report.totalChars + ' 字（保留 ' +
+                  (report.totalChars ? Math.round((report.injectedChars / report.totalChars) * 100) : 100) +
+                  '%，预算 ' + report.budget + ' 字）'
+                : ''),
+          ),
           h(
             'div',
             { className: 'umem-switch' },
@@ -1344,13 +1737,19 @@ window.__ModuleLoader__.load({
         h(
           'div',
           { className: 'umem-tabs' },
-          TABS.map(function (entry) {
-            const pseudo = entry.file === PENDING_KEY || entry.file === TEMP_KEY || entry.file === MODES_KEY;
-            const entryDirty = pseudo
-              ? false
-              : (drafts[entry.file] || '') !== (saved[entry.file] || '');
+          visibleTabs.map(function (entry) {
+            const pseudo =
+              entry.file === PENDING_KEY ||
+              entry.file === TEMP_KEY ||
+              entry.file === MODES_KEY ||
+              entry.file === SETTINGS_KEY;
+            const entryDirty = pseudo ? false : docSignature(docs[entry.file]) !== (savedDocs[entry.file] || '');
             const badge =
               entry.file === PENDING_KEY ? waiting : entry.file === TEMP_KEY ? tempOpen : 0;
+            const section = report && Array.isArray(report.sections)
+              ? report.sections.find(function (item) { return item.file === entry.file; })
+              : null;
+            const cut = section && section.fitted !== 'full' ? section : null;
             return h(
               'button',
               {
@@ -1368,6 +1767,19 @@ window.__ModuleLoader__.load({
               },
               entry.title,
               entryDirty ? h('span', { className: 'umem-dot' }) : null,
+              cut
+                ? h(
+                    'span',
+                    {
+                      className: 'umem-cut',
+                      title:
+                        '这一节有 ' +
+                        (section.fitted === 'dropped' ? '全部' : '部分') +
+                        '条目这次没有进上下文，点开看是哪几条',
+                    },
+                    '!',
+                  )
+                : null,
               badge > 0 ? h('span', { className: 'umem-count' }, badge) : null,
             );
           }),
@@ -1386,19 +1798,9 @@ window.__ModuleLoader__.load({
               ? tempArea()
               : isModes
                 ? modeArea()
-                : h('textarea', {
-                className: 'umem-editor',
-                spellCheck: false,
-                value: drafts[active] || '',
-                onChange: function (event) {
-                  const value = event.target.value;
-                  setDrafts(function (prev) {
-                    const next = Object.assign({}, prev);
-                    next[active] = value;
-                    return next;
-                  });
-                },
-              }),
+                : isSettings
+                  ? settingsArea()
+                  : entryArea(),
         ),
         h(
           'div',
@@ -1435,7 +1837,14 @@ window.__ModuleLoader__.load({
                   className: 'umem-btn',
                   disabled: !dirty,
                   onClick: function () {
-                    setDrafts(Object.assign({}, saved));
+                    const next = {};
+                    FILES.forEach(function (entry) {
+                      const snapshot = savedDocs[entry.file];
+                      if (typeof snapshot === 'string' && snapshot !== '') {
+                        next[entry.file] = JSON.parse(snapshot);
+                      }
+                    });
+                    setDocs(next);
                     setMessage({ kind: 'ok', text: '已放弃全部未保存的改动。' });
                   },
                 },
@@ -1452,7 +1861,9 @@ window.__ModuleLoader__.load({
                   ? '临时记忆有自己的预算（默认 1200 字符），不吃长期记忆的额度。只在被明确要求时才新增；标成完成的条目立刻从注入里消失——「完成即清理」，数据留在这里可恢复。'
                   : isModes
                     ? '工作流有默认，短期目标没有：没选目标的会话不会带任何目标。改完不用重启；选过的会话下一步就用新正文。'
-                    : '保存后立即生效，无需重启。注释 <!-- --> 不会注入给 AI。',
+                    : isSettings
+                      ? '这里的开关只改变面板，不改变注入；想让它真的不进上下文，得删改文件内容。'
+                      : '每条是一个条目：整条进上下文，或整条不进。保存后立即生效，无需重启。',
           ),
         ),
       );

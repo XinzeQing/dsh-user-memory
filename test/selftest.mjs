@@ -76,7 +76,7 @@ await settle()
 const edited = a.box.captured.text()
 check('edit: agent setting appears', edited.includes('先给我方案'))
 check('edit: profile appears', edited.includes('中文交流'))
-check('edit: section order preserved', edited.indexOf('必须遵守') < edited.indexOf('我的行为设定') && edited.indexOf('我的行为设定') < edited.indexOf('用户画像'))
+check('edit: section order preserved', edited.indexOf('必须遵守') < edited.indexOf('行为设定') && edited.indexOf('行为设定') < edited.indexOf('用户画像'))
 
 // ---------- 3. budget bounds the WHOLE block ----------
 const dir2 = await mkdtemp(join(tmpdir(), 'um-'))
@@ -86,7 +86,7 @@ await writeFile(join(dir2, 'rules-must.md'), '# 必须遵守\n\n' + '- 这是一
 await settle()
 const capped = b.box.captured.text()
 check('budget: total block respects maxChars', capped.length <= 300, `len=${capped.length}`)
-check('budget: truncation is announced', capped.includes('已截断'))
+check('budget: truncation is announced', capped.includes('没有进上下文'))
 // The model cannot act on "见记忆目录" unless it is told where that is.
 check('budget: the truncation notice names the memory directory', capped.includes(dir2), `dir=${dir2}`)
 
@@ -99,18 +99,18 @@ const truncedSave = await (
 ).json()
 check(
   'route save: a truncated section is not reported as plain "已生效"',
-  truncedSave.ok === true && truncedSave.injection.includes('只有开头约') && !truncedSave.injection.includes('已生效'),
+  truncedSave.ok === true && truncedSave.injection.includes('条这次没有注入') && !truncedSave.injection.includes('已生效'),
   truncedSave.injection,
 )
 const droppedSave = await (await b.box.route.fetch(request({ action: 'save', file: 'rules-should.md', content: '# 可选遵守\n\n- 这一条更进不去。\n' }))).json()
 check(
   'route save: a dropped section is reported as dropped',
-  droppedSave.ok === true && droppedSave.injection.includes('没有被注入'),
+  droppedSave.ok === true && droppedSave.injection.includes('全部没有注入'),
   droppedSave.injection,
 )
 check(
   'route save: the reply carries the block total',
-  droppedSave.injection.includes('目前整块注入约') && droppedSave.injection.includes('/ 300 字'),
+  droppedSave.injection.includes('目前整块注入约') && droppedSave.injection.includes('预算 300 字') && droppedSave.injection.includes('保留'),
   droppedSave.injection,
 )
 
@@ -166,7 +166,7 @@ await apply(h.ctx, { dir: dir8, maxChars: 300, autoCapture: true })
 await writeFile(join(dir8, 'rules-must.md'), '# 必须遵守\n\n' + '- 这是一条很长的规则。\n'.repeat(60), 'utf8')
 await settle()
 const cappedOn = h.box.captured.text()
-check('autoCapture true: own text still truncated at maxChars', cappedOn.includes('已截断'))
+check('autoCapture true: own text still truncated at maxChars', cappedOn.includes('没有进上下文'))
 check('autoCapture true: notice survives the truncation path', cappedOn.includes('记忆采集提醒'))
 check('autoCapture true: notice sits outside the budget', cappedOn.length > 300, `len=${cappedOn.length}`)
 
@@ -190,7 +190,7 @@ check('route save: ok', saved.ok === true)
 check('route save: explains the injection', typeof saved.injection === 'string' && saved.injection.includes('已生效'), saved.injection)
 check(
   'route save: reports the whole block, not only this section',
-  saved.injection.includes('目前整块注入约') && saved.injection.includes('/ 6000 字'),
+  saved.injection.includes('目前整块注入约') && saved.injection.includes('预算 6000 字'),
   saved.injection,
 )
 check('route save: really wrote the file', (await readFile(join(dir1, 'rules-must.md'), 'utf8')).includes('面板写入测试'))
@@ -287,8 +287,47 @@ check('switch: silent config + silent state = OFF', !k.box.captured.text().inclu
 const kLoaded = await (await k.box.route.fetch(request({ action: 'load' }))).json()
 check('switch: and it reports OFF from the config', kLoaded.autoCapture.on === false && kLoaded.autoCapture.source === 'config', JSON.stringify(kLoaded.autoCapture))
 
-if (realHome === undefined) delete process.env.DSH_HOME
-else process.env.DSH_HOME = realHome
+// ---------- 7. entry-level save (0.8.2) ----------
+// The panel edits one memory at a time and sends the whole doc back; the server
+// owns the grammar, so the bytes on disk are the server's business only.
+const dir9 = await mkdtemp(join(tmpdir(), 'um-'))
+const m = makeCtx()
+await apply(m.ctx, { dir: dir9 })
+const docPayload = {
+  title: '用户画像',
+  comments: ['<!-- 手写备注 -->'],
+  preamble: [],
+  groups: [
+    { title: '沟通', entries: [{ kind: 'bullet', text: '- 用中文。', sep: '\n' }, { kind: 'bullet', text: '- 指代用名词。', sep: '\n' }] },
+    { title: '成本', entries: [{ kind: 'block', text: '一句话段落。', sep: '\n\n' }] },
+  ],
+}
+const docSaved = await (await m.box.route.fetch(request({ action: 'saveDoc', file: 'profile.md', doc: docPayload }))).json()
+const expectedDoc = '# 用户画像\n\n<!-- 手写备注 -->\n\n## 沟通\n- 用中文。\n- 指代用名词。\n\n## 成本\n\n一句话段落。\n'
+check('saveDoc: accepted', docSaved.ok === true, JSON.stringify(docSaved).slice(0, 120))
+check(
+  'saveDoc: writes exactly the composed markdown',
+  (await readFile(join(dir9, 'profile.md'), 'utf8')) === expectedDoc,
+  JSON.stringify(await readFile(join(dir9, 'profile.md'), 'utf8')),
+)
+check('saveDoc: returns the doc it stored', docSaved.doc?.groups?.length === 2 && docSaved.entries === 3, JSON.stringify(docSaved.doc)?.slice(0, 120))
+check('saveDoc: returns the per-entry report', docSaved.report !== undefined && docSaved.report.sections.length >= 1)
+check('saveDoc: reports the injection', typeof docSaved.injection === 'string' && docSaved.injection.includes('已生效'), docSaved.injection)
+const docAgain = await (await m.box.route.fetch(request({ action: 'saveDoc', file: 'profile.md', doc: docSaved.doc }))).json()
+check('saveDoc: round-trips without drift', docAgain.content === expectedDoc, JSON.stringify(docAgain.content))
+const badDoc = await (await m.box.route.fetch(request({ action: 'saveDoc', file: 'profile.md', doc: null }))).json()
+check('saveDoc: refuses a malformed doc', badDoc.ok === false && badDoc.error === '内容格式不对')
+const loadedDoc = await (await m.box.route.fetch(request({ action: 'load' }))).json()
+check(
+  'route load: carries the parsed doc',
+  loadedDoc.files.every((file) => file.doc !== undefined && Array.isArray(file.doc.groups)),
+  JSON.stringify(loadedDoc.files.map((file) => [file.file, file.doc?.groups?.length])),
+)
+check('route load: carries the injection report', loadedDoc.injection !== undefined && typeof loadedDoc.injection.budget === 'number')
+
+
+if (realHome !== undefined) process.env.DSH_HOME = realHome
+
 
 for (const x of [a, b, c, d, e, f, g, h, i, j, k]) for (const fn of x.box.disposers) if (typeof fn === 'function') fn()
 
