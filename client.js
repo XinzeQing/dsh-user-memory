@@ -176,6 +176,9 @@ window.__ModuleLoader__.load({
       '.umem-meterbar{width:110px;height:6px;border-radius:3px;background:var(--dsw-alias-border-l1);overflow:hidden;}',
       '.umem-meterfill{height:100%;background:var(--dsw-alias-state-success-primary);}',
       '.umem-settings{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:14px;max-width:680px;}',
+      '.umem-stale{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:10px;max-width:860px;font-size:13px;line-height:1.6;}',
+      '.umem-stale-title{font-weight:600;}',
+      '.umem-raw{margin:0;padding:12px;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:var(--dsw-alias-bg-l1);white-space:pre-wrap;word-break:break-word;font-size:12px;line-height:1.6;max-height:52vh;overflow:auto;}',
       '.umem-label{display:flex;align-items:center;gap:8px;font-size:13px;}',
       '.umem-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}',
       '.umem-foot{display:flex;align-items:center;gap:12px;padding:0 24px 18px;flex-wrap:wrap;}',
@@ -391,6 +394,11 @@ window.__ModuleLoader__.load({
       // 也只需要把 docs 换回saved 的那一份）。
       const [docs, setDocs] = useState({});
       const [savedDocs, setSavedDocs] = useState({});
+      // 宿主还跑着旧版插件时（改了 index.js 但没重启 DSH），`load` 不会带
+      // `doc`，面板若默默按空文档渲染，看起来就像长期记忆被清空了。这里把
+      // 原文留在 `raws` 里，并明确告诉人「文件在，是进程旧」，别让人误判。
+      const [raws, setRaws] = useState({});
+      const [staleHost, setStaleHost] = useState(false);
       // 上一次 render() 的结果：哪一条进了上下文、哪一条没进。失真度提示全靠它。
       const [report, setReport] = useState(null);
       const [ui, setUi] = useState(readUi);
@@ -444,13 +452,21 @@ window.__ModuleLoader__.load({
           if (!data || data.ok !== true) throw new Error((data && data.error) || '读取失败');
           const docMap = {};
           const savedMap = {};
+          const rawMap = {};
+          let stale = false;
           for (const entry of data.files) {
+            if (!entry.doc || typeof entry.doc !== 'object') {
+              stale = true;
+              rawMap[entry.file] = entry.content || '';
+            }
             const doc = entry.doc || { title: '', comments: [], preamble: [], groups: [] };
             docMap[entry.file] = doc;
             savedMap[entry.file] = JSON.stringify(doc);
           }
           setDocs(docMap);
           setSavedDocs(savedMap);
+          setRaws(rawMap);
+          setStaleHost(stale);
           setReport(data.injection || null);
           setDir(data.dir || '');
           setCapture(
@@ -536,17 +552,9 @@ window.__ModuleLoader__.load({
         [loadSuggestions, loadTemp],
       );
 
-      // A profile with `tempMemory: false` has no working set to show: opening
-      // the panel on that tab would greet the user with "未启用" instead of the
-      // files the panel exists for. Once the host has said so, move off it.
-      useEffect(
-        function () {
-          if (!tempKnown || tempEnabled || active !== TEMP_KEY) return;
-          setActive(FILES[0].file);
-          writeActiveTab(FILES[0].file);
-        },
-        [tempKnown, tempEnabled, active],
-      );
+      // 一个 profile 把 tempMemory 关掉时，这个标签页仍然留着：点进去会说明
+      // 为什么用不了、开关在哪。这里曾经把 active 弹回第一个文件页，结果点一下
+      // 就被弹回去，看起来像「点不进」——比直接说明原因更糟，所以不弹了。
 
       const dirty = FILES.some((entry) => docSignature(docs[entry.file]) !== (savedDocs[entry.file] || ''));
 
@@ -589,6 +597,13 @@ window.__ModuleLoader__.load({
       }, []);
 
       const save = useCallback(async () => {
+        if (staleHost) {
+          setMessage({
+            kind: 'warn',
+            text: '宿主还是旧版：现在保存会用空文档覆盖这一节。先重启 DeepSeek Harness，记忆文件本身没有丢。',
+          });
+          return;
+        }
         setSaving(true);
         setMessage(null);
         try {
@@ -615,7 +630,7 @@ window.__ModuleLoader__.load({
         } finally {
           setSaving(false);
         }
-      }, [active, docs]);
+      }, [active, docs, staleHost]);
 
       // The one action the model can never take: deciding.
       const resolve = useCallback(
@@ -1032,7 +1047,7 @@ window.__ModuleLoader__.load({
               h(
                 'div',
                 { style: { marginTop: 10 } },
-                '它的开关在插件配置里：把 tempMemory 设为 true 并重载插件后，注入的「临时记忆」一节、temp_memory / temp_memory_done 两个工具，以及这个面板才会挂上。',
+                '它的开关在插件配置里：把 tempMemory 设为 true 并重载插件（改 profile 的 cordis.patch.yml 之后要重启 DeepSeek Harness）后，注入的「临时记忆」一节、temp_memory / temp_memory_done 两个工具，以及这个面板才会挂上。',
               ),
             ),
           );
@@ -1499,6 +1514,22 @@ window.__ModuleLoader__.load({
       };
 
       function entryArea() {
+        if (staleHost) {
+          return h(
+            'div',
+            { className: 'umem-stale' },
+            h('div', { className: 'umem-stale-title' }, '记忆文件都在，只是面板比宿主新。'),
+            h(
+              'div',
+              null,
+              '浏览器里的面板已经是新版的按条编辑器，但 DeepSeek Harness 进程里跑的仍是旧版插件，' +
+                '旧版读出来的数据没有「条目」结构，所以这里先显示原文、暂时不能按条编辑。' +
+                '重启 DeepSeek Harness 之后就恢复正常；文件本身一个字节没动。',
+            ),
+            h('pre', { className: 'umem-raw' }, raws[active] || ''),
+            h('div', { className: 'umem-stale-title' }, '目录：' + (dir || '（见 memory_suggest 的 dir）')),
+          );
+        }
         if (!activeDoc) {
           return h('div', { className: 'umem-center' }, h('div', null, '读取中…'));
         }
