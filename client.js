@@ -477,8 +477,8 @@ window.__ModuleLoader__.load({
             kind: 'ok',
             text:
               next
-                ? '记忆采集已开启：AI 从下一轮对话起会主动提议值得长期记住的偏好（仍然只进「待确认」，要用户点「采纳」才写）。'
-                : '记忆采集已关闭：AI 不再主动提议，系统提示词回到逐字节和以前一样。',
+                ? '自动提议提醒已开启：AI 从下一轮对话起会主动提议值得长期记住的偏好（仍然只进「待确认」，要用户点「采纳」才写）。'
+                : '自动提议提醒已关闭：AI 不再主动提议，系统提示词回到逐字节和以前一样。',
           });
         } catch (error) {
           setMessage({ kind: 'err', text: '设置失败：' + String(error && error.message ? error.message : error) });
@@ -1330,7 +1330,7 @@ window.__ModuleLoader__.load({
                 className: 'umem-dot',
                 style: capture && capture.on ? { background: 'var(--dsw-alias-state-success-primary)' } : null,
               }),
-              '自动采集记忆：' + (capture === null ? '读取中…' : capture.on ? '已开启' : '已关闭'),
+              '自动提议提醒：' + (capture === null ? '读取中…' : capture.on ? '已开启' : '已关闭'),
             ),
             h(
               'div',

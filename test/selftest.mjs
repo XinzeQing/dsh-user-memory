@@ -87,6 +87,32 @@ await settle()
 const capped = b.box.captured.text()
 check('budget: total block respects maxChars', capped.length <= 300, `len=${capped.length}`)
 check('budget: truncation is announced', capped.includes('已截断'))
+// The model cannot act on "见记忆目录" unless it is told where that is.
+check('budget: the truncation notice names the memory directory', capped.includes(dir2), `dir=${dir2}`)
+
+// ---------- 3b. the save reply reports what actually reached the prompt ----------
+// It used to answer "已生效" for a section the budget had already cut in half.
+const truncedSave = await (
+  await b.box.route.fetch(
+    request({ action: 'save', file: 'rules-must.md', content: '# 必须遵守\n\n' + '- 这一节自己就超出预算。\n'.repeat(40) }),
+  )
+).json()
+check(
+  'route save: a truncated section is not reported as plain "已生效"',
+  truncedSave.ok === true && truncedSave.injection.includes('只有开头约') && !truncedSave.injection.includes('已生效'),
+  truncedSave.injection,
+)
+const droppedSave = await (await b.box.route.fetch(request({ action: 'save', file: 'rules-should.md', content: '# 可选遵守\n\n- 这一条更进不去。\n' }))).json()
+check(
+  'route save: a dropped section is reported as dropped',
+  droppedSave.ok === true && droppedSave.injection.includes('没有被注入'),
+  droppedSave.injection,
+)
+check(
+  'route save: the reply carries the block total',
+  droppedSave.injection.includes('目前整块注入约') && droppedSave.injection.includes('/ 300 字'),
+  droppedSave.injection,
+)
 
 // ---------- 4. all files empty -> nothing injected ----------
 const dir3 = await mkdtemp(join(tmpdir(), 'um-'))
@@ -162,6 +188,11 @@ check('route load: reports the directory', loaded.dir === dir1)
 const saved = await (await route.fetch(request({ action: 'save', file: 'rules-must.md', content: '# 必须遵守\n\n- 面板写入测试。\n' }))).json()
 check('route save: ok', saved.ok === true)
 check('route save: explains the injection', typeof saved.injection === 'string' && saved.injection.includes('已生效'), saved.injection)
+check(
+  'route save: reports the whole block, not only this section',
+  saved.injection.includes('目前整块注入约') && saved.injection.includes('/ 6000 字'),
+  saved.injection,
+)
 check('route save: really wrote the file', (await readFile(join(dir1, 'rules-must.md'), 'utf8')).includes('面板写入测试'))
 await settle()
 check('route save: injection refreshed immediately', a.box.captured.text().includes('面板写入测试'))

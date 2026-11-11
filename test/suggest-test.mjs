@@ -5,7 +5,7 @@
 // says so". These tests drive the real host module with a fake Cordis context
 // and check that promise from both ends: the tool can only propose, and only
 // the panel route can decide.
-import { mkdtemp, readFile } from 'node:fs/promises'
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -434,7 +434,72 @@ check(
   dismissedPlain.status === 'dismissed' && dismissedPlain.userNote === '',
 )
 
-for (const entry of [first, second]) {
+// ---------- 17. an acceptance belongs to the conversation that asked for it ----------
+// 0.8.0 kept every acceptance in one global queue: an item accepted in a chat the
+// user had already closed was handed to whatever session spoke next, and the model
+// then "wrote the memory" in a conversation that had never seen the suggestion.
+const noOriginText = (await sItems()).find((i) => i.id === plainItem.id)
+check('route: an item proposed without an agent carries no origin', noOriginText.originSession === '')
+const legacyTurn2 = await second.box.preStep(
+  { agent: { id: 'session-B' }, messages: [{ source: { kind: 'user' } }] },
+  async () => ({ kind: 'enter', messages: [] }),
+)
+check(
+  'route: an item with no origin still reaches the next real turn',
+  Array.isArray(legacyTurn2.messages) && legacyTurn2.messages.length > 0,
+)
+
+const routed = await sSuggest.execute({ file: 'log.md', text: '只属于会话 A 的建议' }, { agent: { id: 'session-A' } })
+check(
+  'route: the proposal records its origin session',
+  (await sStored()).find((i) => i.id === routed.id).originSession === 'session-A',
+  JSON.stringify((await sStored()).find((i) => i.id === routed.id)),
+)
+await sPost({ action: 'resolveSuggestion', id: routed.id, decision: 'accept' })
+
+const otherDecision = { kind: 'enter', messages: [] }
+const otherTurn = await second.box.preStep(
+  { agent: { id: 'session-B' }, messages: [{ source: { kind: 'user' } }] },
+  async () => otherDecision,
+)
+check('route: another session is NOT handed the acceptance', otherTurn === otherDecision)
+check(
+  'route: it stays accepted for its own session',
+  (await sItems()).find((i) => i.id === routed.id).status === 'accepted',
+)
+
+const homeDecision = { kind: 'enter', messages: [] }
+const homeTurn = await second.box.preStep(
+  { agent: { id: 'session-A' }, messages: [{ source: { kind: 'user' } }] },
+  async () => homeDecision,
+)
+check(
+  'route: the origin session gets the notice',
+  homeTurn !== homeDecision &&
+    Array.isArray(homeTurn.messages) &&
+    homeTurn.messages.some((m) => m.content[0].text.includes('只属于会话 A 的建议')),
+)
+
+// An acceptance whose origin session never comes back must not sit invisible
+// forever: past the grace period, whichever session speaks next picks it up.
+const stranded = await sSuggest.execute({ file: 'log.md', text: '原会话再也没回来的建议' }, { agent: { id: 'session-Z' } })
+await sPost({ action: 'resolveSuggestion', id: stranded.id, decision: 'accept' })
+const storeFile = join(home, 'memory-suggest.json')
+const backdated = JSON.parse(await readFile(storeFile, 'utf8'))
+backdated.items.find((i) => i.id === stranded.id).decidedAt = new Date(Date.now() - 40 * 60 * 1000).toISOString()
+await writeFile(storeFile, JSON.stringify(backdated, null, 2), 'utf8')
+const third = makeCtx()
+await apply(third.ctx, { dir: memDir })
+const lateTurn = await third.box.preStep(
+  { agent: { id: 'session-B' }, messages: [{ source: { kind: 'user' } }] },
+  async () => ({ kind: 'enter', messages: [] }),
+)
+check(
+  'route: a stranded acceptance is claimed after the grace period',
+  Array.isArray(lateTurn.messages) && lateTurn.messages.some((m) => m.content[0].text.includes('原会话再也没回来的建议')),
+)
+
+for (const entry of [first, second, third]) {
   for (const fn of entry.box.disposers) if (typeof fn === 'function') fn()
 }
 

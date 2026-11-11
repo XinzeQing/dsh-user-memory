@@ -90,6 +90,12 @@ const SUGGEST_FILE = 'memory-suggest.json'
 const SWITCH_FILE = '.autocapture'
 /** Hard ceiling for one suggestion's wording. */
 const MAX_SUGGEST_CHARS = 4000
+/**
+ * How long an accepted suggestion waits for the conversation that asked for it.
+ * Past this, whichever session speaks next picks it up: an acceptance made while
+ * its origin session was already closed must not strand forever.
+ */
+const ACCEPTED_ORPHAN_MS = 30 * 60 * 1000
 /** Hard ceiling for the user's own supplement ("补充说明") attached to one suggestion. */
 const MAX_NOTE_CHARS = 1000
 /** Decided suggestions are pruned once the store grows past this. */
@@ -250,40 +256,99 @@ function meaningful(body) {
   return body.replace(/^#{1,6}\s.*$/gm, '').trim()
 }
 
+/** The conversation an agent belongs to: `Agent.id` IS the session id. */
+function sessionIdOf(agent) {
+  const id = agent?.session?.id ?? agent?.id
+  return typeof id === 'string' ? id : ''
+}
+
 /**
  * What this content will actually do to the prompt — shown in the panel so the
  * user never has to guess whether an edit took effect.
+ *
+ * `report` is the bookkeeping of the last `render()` call. Without it the message
+ * could only say "this section is injected", which is exactly the wrong thing to
+ * say when the budget cut the section in half — the panel used to promise that
+ * every saved section reached the model.
  */
-function describeInjection(file, content) {
+function describeInjection(file, content, report) {
   const spec = SECTIONS.find((entry) => entry.file === file)
   if (spec === undefined) return '这个文件不注入（只作为用户自己的记录）。'
   const body = meaningful(stripComments(content))
   if (body === '') return '目前这一节是空的（只剩标题或注释），不会注入。'
-  return `已生效：这一节会注入（约 ${[...body].length} 字）。`
+  const size = [...body].length
+  if (report === undefined) return `已生效：这一节会注入（约 ${size} 字）。`
+  const total = `目前整块注入约 ${[...report.text].length} / ${report.budget} 字。`
+  // "已生效" is a claim about reaching the model. Say it only when it is true:
+  // promising "约 559 字会注入" for a section the budget cut to 123 字 is the
+  // exact failure this route exists to prevent.
+  const entry = report.sections.find((section) => section.file === file)
+  if (entry === undefined) return `已保存，但预算在前面几节就用完了，这一节这次没有被注入。${total}`
+  if (entry.fitted === 'dropped') return `已保存，但预算已满，这一节这次没有被注入（内容仍然保存了）。${total}`
+  if (entry.fitted === 'partial') {
+    return `已保存，但超出预算：这一节 ${size} 字里只有开头约 ${entry.chars} 字会注入，后面被截掉了。${total}`
+  }
+  return `已生效：这一节会注入（约 ${size} 字）。${total}`
 }
 
-/** Appended when a section does not fit; its length is part of the budget. */
-const TRUNCATION_NOTICE = '\n\n…（本段超出预算已截断，完整内容见记忆目录）'
+/**
+ * Appended when a section does not fit; its length is part of the budget.
+ *
+ * The path matters: "完整内容见记忆目录" cannot be acted on by a model that was
+ * never told where the directory is. It is the fallback form only, used when the
+ * full notice would leave too little room to inject anything at all.
+ */
+const SHORT_TRUNCATION_NOTICE = '\n\n…（本段超出预算已截断，完整内容见记忆目录）'
 
-/** Compose the injected block. `maxChars` bounds the whole block, preamble and notice included. */
-function render(parts, maxChars) {
-  if (parts.length === 0) return ''
+function truncationNotice(dir) {
+  return dir === undefined || dir === ''
+    ? SHORT_TRUNCATION_NOTICE
+    : `\n\n…（本段超出预算已截断，完整内容见 ${dir}）`
+}
+
+/**
+ * Compose the injected block. `maxChars` bounds the whole block, preamble and
+ * notice included.
+ *
+ * Returns the text plus what happened to each section (`full` / `partial` /
+ * `dropped`): "did this section actually reach the model" cannot be recovered
+ * from the string afterwards, and the panel has to report it truthfully.
+ */
+function render(parts, maxChars, dir) {
+  const report = { text: '', budget: maxChars, sections: [] }
+  if (parts.length === 0) return report
   const budget = maxChars - PREAMBLE.length - 2
-  if (budget <= 0) return ''
+  if (budget <= 0) return report
   let body = ''
-  for (const part of parts) {
+  let index = 0
+  for (; index < parts.length; index += 1) {
+    const part = parts[index]
     const chunk = `\n\n### ${part.title}\n\n${part.body}`
     if (body.length + chunk.length <= budget) {
       body += chunk
+      report.sections.push({ file: part.file, chars: part.body.length, fitted: 'full' })
       continue
     }
-    const room = budget - body.length - TRUNCATION_NOTICE.length
+    // Prefer the notice carrying the path; a tiny budget that cannot afford it
+    // still gets the old short one, so truncation stays announced either way.
+    let notice = truncationNotice(dir)
+    let room = budget - body.length - notice.length
+    if (room < 120) {
+      notice = SHORT_TRUNCATION_NOTICE
+      room = budget - body.length - notice.length
+    }
     if (room >= 120) {
-      body += chunk.slice(0, room) + TRUNCATION_NOTICE
+      body += chunk.slice(0, room) + notice
+      report.sections.push({ file: part.file, chars: room, fitted: 'partial' })
+      index += 1
     }
     break
   }
-  return body.length === 0 ? '' : PREAMBLE + body
+  for (; index < parts.length; index += 1) {
+    report.sections.push({ file: parts[index].file, chars: 0, fitted: 'dropped' })
+  }
+  report.text = body.length === 0 ? '' : PREAMBLE + body
+  return report
 }
 
 /**
@@ -832,7 +897,7 @@ export async function apply(ctx, config = {}) {
         },
       ],
     },
-    execute: async (args) => {
+    execute: async (args, exec) => {
       const file = typeof args?.file === 'string' ? args.file : ''
       const text = typeof args?.text === 'string' ? args.text.trim() : ''
       if (!EDITABLE_FILES.includes(file)) throw new Error(`不允许的记忆文件：${file || '(空)'}`)
@@ -845,6 +910,10 @@ export async function apply(ctx, config = {}) {
         why: typeof args?.why === 'string' ? args.why.trim().slice(0, 1000) : '',
         createdAt: new Date().toISOString(),
         status: 'pending',
+        // Which conversation asked for this. The acceptance notice is delivered to
+        // that session's next user turn; without the field it would follow whoever
+        // happened to speak next, including an unrelated chat.
+        originSession: sessionIdOf(exec?.agent),
       })
       prune()
       await saveStore()
@@ -897,7 +966,9 @@ export async function apply(ctx, config = {}) {
       '用户说「写临时记忆 / 记到临时记忆 / 交付记忆 / 换会话执行 / 下次对话接着做」，或让你把某件事记下来交给别的对话。' +
       '除此之外一律不要调用——不要在你觉得有用时写，不要自动总结，不要顺手记，否则会吃满用户的上下文预算。' +
       'kind：handoff=交接（给另一个对话的交付信息）、stage=阶段目标（眼下在做的事，减少重复说明）、' +
-      'waiting=等待项（等条件满足再执行）。交接条目同时是交付文档，正文可以写长、写全。',
+      'waiting=等待项（等条件满足再执行）。交接条目同时是交付文档，正文可以写长、写全；' +
+      '但这一层有独立的小预算（默认 1200 字），装不下的条目不会进上下文，只会留下 #id 和文件路径——' +
+      '要给对话直接用的内容写短，长文档交给交接条目。',
     parameters: toolSchema({
       kind: {
         type: 'string',
@@ -1034,13 +1105,30 @@ export async function apply(ctx, config = {}) {
   // internal steps (compaction, titles, background agents), so an acceptance
   // waits for a step that actually carries a typed user message instead of being
   // silently consumed by one of those.
+  //
+  // The notice is also routed to the conversation that asked for the suggestion.
+  // It used to sit in one global queue, so an acceptance left over from a chat
+  // the user had already closed was handed to whatever session spoke next — the
+  // model then "wrote the memory" in a chat that had never seen the suggestion.
   ctx.on('agent/pre-step', async (payload, next) => {
     const decision = await next()
     if (decision?.kind === 'reject') return decision
-    const accepted = store.items.filter((item) => item.status === 'accepted')
-    if (accepted.length === 0) return decision
+    if (store.items.length === 0) return decision
     const messages = Array.isArray(payload?.messages) ? payload.messages : []
     if (!messages.some((message) => message?.source?.kind === 'user')) return decision
+    const sessionId = sessionIdOf(payload?.agent)
+    const now = Date.now()
+    const claimable = (item) => {
+      // Items stored before `originSession` existed carry '' and stay global.
+      if (item.originSession === undefined || item.originSession === '') return true
+      if (sessionId === '' || item.originSession === sessionId) return true
+      // Safety net: an acceptance whose origin session never returns must not
+      // stay invisible forever.
+      const stamp = Date.parse(item.decidedAt ?? '')
+      return Number.isNaN(stamp) ? true : now - stamp > ACCEPTED_ORPHAN_MS
+    }
+    const accepted = store.items.filter((item) => item.status === 'accepted' && claimable(item))
+    if (accepted.length === 0) return decision
     for (const item of accepted) {
       item.status = 'delivered'
       item.deliveredAt = new Date().toISOString()
@@ -1056,6 +1144,9 @@ export async function apply(ctx, config = {}) {
   // The temp working set is its own section with its own budget, so it needs its
   // own published string; both are refreshed together by `reload`.
   let tempText = ''
+  // What the last `render()` did to each section; the save reply reads it, so a
+  // truncated or dropped section is never described as "injected".
+  let lastReport
 
   // Reads the files and republishes `text`. Never called concurrently with
   // itself: `refresh` guards it, and the switch action awaits it directly.
@@ -1066,9 +1157,10 @@ export async function apply(ctx, config = {}) {
     for (const spec of SECTIONS) {
       const raw = await readFile(join(dir, spec.file), 'utf8').catch(() => '')
       const body = stripComments(raw)
-      if (meaningful(body)) parts.push({ title: spec.title, body })
+      if (meaningful(body)) parts.push({ file: spec.file, title: spec.title, body })
     }
-    text = render(parts, maxChars) + (autoCapture ? AUTO_CAPTURE_NOTICE : '')
+    lastReport = render(parts, maxChars, dir)
+    text = lastReport.text + (autoCapture ? AUTO_CAPTURE_NOTICE : '')
     // The temp store lives in this process, exactly like the suggestion store:
     // it is not re-read from disk on every poll. A hand edit of the JSON lands at
     // the next restart, which is the same rule the waiting area already follows
@@ -1136,11 +1228,6 @@ export async function apply(ctx, config = {}) {
   // very next model step without a restart. Same install/dispose pattern as
   // `dsh-file-reference-local` (lib/index.js:339-372).
   const modeFibers = new Map()
-
-  const sessionIdOf = (agent) => {
-    const id = agent?.session?.id ?? agent?.id
-    return typeof id === 'string' ? id : ''
-  }
 
   const installModes = (agent) => {
     if (agent === null || typeof agent !== 'object') return
@@ -1579,7 +1666,7 @@ export async function apply(ctx, config = {}) {
       // Make the change visible to the very next model step instead of waiting
       // out the poll interval.
       await refresh()
-      return Response.json({ ok: true, file, injection: describeInjection(file, content) })
+      return Response.json({ ok: true, file, injection: describeInjection(file, content, lastReport) })
     }
 
     return Response.json({ ok: false, error: '未知操作' }, { status: 400 })
@@ -1606,5 +1693,13 @@ export async function apply(ctx, config = {}) {
     ctx.logger?.info?.(`user-memory: 图形面板接口已注册 ${ROUTE_PATH}`)
   })
 
-  ctx.logger?.info?.(`user-memory: watching ${dir} (budget ${maxChars} chars)`)
+  // Spelled out, not summarised: a profile patch replaces `config` wholesale
+  // (Loader never deep-merges), so a patch that restates one key silently drops
+  // the rest back to these defaults. Printing the resolved values is the only way
+  // to notice that from the outside.
+  ctx.logger?.info?.(
+    `user-memory: watching ${dir} ` +
+      `(budget ${maxChars} chars, autoCapture ${configAutoCapture ? 'on' : 'off'}` +
+      `, tempMemory ${tempEnabled ? `on (${tempMaxChars} chars)` : 'off'})`,
+  )
 }

@@ -403,7 +403,7 @@ check('panel: the delivered card explains why it cannot be revoked', text().incl
 // ---------- 8. the auto-capture switch ----------
 // The switch must be usable the moment the panel opens, and must never show a
 // state it merely assumes: it renders what the host reported.
-const switchButton = () => buttonByText('自动采集记忆：')
+const switchButton = () => buttonByText('自动提议提醒：')
 check('panel: the switch is visible without opening any tab', switchButton() !== undefined)
 check('panel: it shows the state the host reported', switchButton().textContent.includes('已关闭'), switchButton().textContent)
 check(
