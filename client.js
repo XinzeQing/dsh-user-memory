@@ -169,7 +169,7 @@ window.__ModuleLoader__.load({
       '.umem-dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--dsw-alias-state-warn-primary);margin-left:6px;vertical-align:middle;}',
       '.umem-cut{display:inline-flex;align-items:center;justify-content:center;min-width:14px;height:14px;border-radius:7px;background:var(--dsw-alias-state-warn-primary);color:var(--dsw-alias-bg-base);font-size:10px;font-weight:700;margin-left:4px;line-height:1;}',
       '.umem-iconwrap{position:relative;display:inline-flex;align-items:center;justify-content:center;}',
-      '.umem-badge{position:absolute;top:-2px;right:-3px;width:7px;height:7px;border-radius:50%;background:var(--dsw-alias-state-error-primary);box-shadow:0 0 0 1.5px var(--dsw-alias-bg-base);pointer-events:none;}',
+      '.umem-badge{position:absolute;top:-2px;right:-3px;width:7px;height:7px;border-radius:50%;background:var(--dsw-alias-label-primary,#fff);box-shadow:0 0 0 1.5px var(--dsw-alias-bg-base);pointer-events:none;}',
       '.umem-hintbar{padding:8px 24px 0;font-size:12px;color:var(--dsw-alias-label-tertiary);}',
       '.umem-body{flex:1;min-height:0;padding:10px 24px;display:flex;}',
       '.umem-editor{flex:1;min-height:0;width:100%;box-sizing:border-box;resize:none;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);padding:12px 14px;font-family:ui-monospace,Consolas,"Courier New",monospace;font-size:13px;line-height:1.65;}',
@@ -207,7 +207,7 @@ window.__ModuleLoader__.load({
       '.umem-msg[data-kind="ok"]{color:var(--dsw-alias-state-success-primary);}',
       '.umem-msg[data-kind="err"]{color:var(--dsw-alias-state-error-primary);}',
       '.umem-center{flex:1;display:flex;align-items:center;justify-content:center;padding:40px;color:var(--dsw-alias-label-secondary);font-size:13px;text-align:center;line-height:1.9;}',
-      '.umem-count{display:inline-block;min-width:16px;margin-left:6px;padding:0 5px;border-radius:9px;background:var(--dsw-alias-brand-primary);color:var(--dsw-alias-label-inverse,#fff);font-size:11px;line-height:16px;text-align:center;}',
+      '.umem-count{display:inline-block;min-width:16px;margin-left:6px;padding:0 5px;border-radius:9px;background:var(--dsw-alias-label-primary,#2b3440);color:var(--dsw-alias-bg-base,#fff);font-size:11px;font-weight:600;line-height:16px;text-align:center;}',
       '.umem-body[data-flat="1"]{padding:10px 24px 0;}',
       '.umem-list{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:12px;}',
       '.umem-card{border:1px solid var(--dsw-alias-border-l1);border-radius:10px;padding:12px 14px;background:var(--dsw-alias-bg-layer-1);}',
@@ -1787,6 +1787,24 @@ window.__ModuleLoader__.load({
         return h(
           'div',
           { className: 'umem-settings' },
+          h('div', { className: 'umem-sectitle' }, '提示'),
+          h(
+            'label',
+            { className: 'umem-label' },
+            h('input', {
+              type: 'checkbox',
+              checked: ui.dot !== false,
+              onChange: function (event) {
+                setDot(event.target.checked);
+              },
+            }),
+            '待确认区有未处理的建议时，左侧「多功能记忆」图标显示红点',
+          ),
+          h(
+            'div',
+            { className: 'umem-msg' },
+            '红点只说明「待确认区里有东西在等你决定」：它不写记忆、不进上下文，也不通知 AI。关掉它只是不再提醒，建议本身还在待确认区。颜色跟随主题（深色主题下是浅色点），不一定是红色。',
+          ),
           h('div', { className: 'umem-sectitle' }, '预设'),
           h(
             'div',
@@ -1839,24 +1857,7 @@ window.__ModuleLoader__.load({
             { className: 'umem-msg' },
             '隐藏只影响面板看不看得到，不影响注入：藏起来的记忆照样每轮都会进上下文。要让它真的不注入，只能改文件内容。',
           ),
-          h('div', { className: 'umem-sectitle' }, '提示'),
-          h(
-            'label',
-            { className: 'umem-label' },
-            h('input', {
-              type: 'checkbox',
-              checked: ui.dot !== false,
-              onChange: function (event) {
-                setDot(event.target.checked);
-              },
-            }),
-            '待确认区有未处理的建议时，左侧「多功能记忆」图标显示红点',
-          ),
-          h(
-            'div',
-            { className: 'umem-msg' },
-            '红点只说明「待确认区里有东西在等你决定」：它不写记忆、不进上下文，也不通知 AI。关掉它只是不再提醒，建议本身还在待确认区。',
-          ),
+
           h(
             'div',
             { className: 'umem-arch' },

@@ -753,6 +753,11 @@ check('panel: 全部 brings the hidden tabs back', buttonByText('临时记忆') 
 // whether the sidebar icon may say "有东西在等你". Off must still keep the queue.
 const dotLabel = () => [...container.querySelectorAll('.umem-label')].find((label) => label.textContent.includes('红点'))
 check('panel: 设置 offers a red-dot switch', dotLabel() !== undefined)
+check(
+  'panel: the red-dot switch is the first thing in 设置, not below the fold',
+  (container.querySelector('.umem-sectitle') || {}).textContent === '提示',
+  (container.querySelector('.umem-sectitle') || {}).textContent || 'MISSING',
+)
 const dotBox = () => dotLabel() && dotLabel().querySelector('input[type=checkbox]')
 check('panel: the red dot is on by default', dotBox() !== null && dotBox().checked === true)
 const decidesBeforeDot = sent.filter((p) => p.action === 'resolveSuggestion').length
