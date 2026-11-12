@@ -51,18 +51,34 @@ window.__ModuleLoader__.load({
         const raw = window.localStorage.getItem(UI_KEY);
         const parsed = raw === null ? null : JSON.parse(raw);
         if (parsed && Array.isArray(parsed.hidden)) {
-          return { hidden: parsed.hidden.filter((value) => typeof value === 'string'), preset: typeof parsed.preset === 'string' ? parsed.preset : 'custom' };
+          return {
+            hidden: parsed.hidden.filter((value) => typeof value === 'string'),
+            preset: typeof parsed.preset === 'string' ? parsed.preset : 'custom',
+            // Red dot on the sidebar icon. On by default: a waiting suggestion is
+            // exactly the kind of thing that stays invisible unless something
+            // points at it. Purely a panel hint — it never touches the injected
+            // text, so the prompt stays byte-identical.
+            dot: parsed.dot !== false,
+          };
         }
       } catch (error) {
         /* no storage: every tab stays visible */
       }
-      return { hidden: [], preset: 'all' };
+      return { hidden: [], preset: 'all', dot: true };
     };
     const writeUi = (ui) => {
       try {
         window.localStorage.setItem(UI_KEY, JSON.stringify(ui));
       } catch (error) {
         /* no storage: the setting lasts for this session only */
+      }
+      // The sidebar icon is mounted outside the panel and cannot read the panel's
+      // state; a window event is the cheapest way to make it re-read the switch
+      // the moment it flips.
+      try {
+        window.dispatchEvent(new Event('umem-ui-changed'));
+      } catch (error) {
+        /* not a browser context: nothing to notify */
       }
     };
 
@@ -152,6 +168,8 @@ window.__ModuleLoader__.load({
       '.umem-tab[data-on="1"]{background:var(--dsw-alias-interactive-selected);color:var(--dsw-alias-label-primary);border-color:var(--dsw-alias-border-l1);}',
       '.umem-dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--dsw-alias-state-warn-primary);margin-left:6px;vertical-align:middle;}',
       '.umem-cut{display:inline-flex;align-items:center;justify-content:center;min-width:14px;height:14px;border-radius:7px;background:var(--dsw-alias-state-warn-primary);color:var(--dsw-alias-bg-base);font-size:10px;font-weight:700;margin-left:4px;line-height:1;}',
+      '.umem-iconwrap{position:relative;display:inline-flex;align-items:center;justify-content:center;}',
+      '.umem-badge{position:absolute;top:-2px;right:-3px;width:7px;height:7px;border-radius:50%;background:var(--dsw-alias-state-error-primary);box-shadow:0 0 0 1.5px var(--dsw-alias-bg-base);pointer-events:none;}',
       '.umem-hintbar{padding:8px 24px 0;font-size:12px;color:var(--dsw-alias-label-tertiary);}',
       '.umem-body{flex:1;min-height:0;padding:10px 24px;display:flex;}',
       '.umem-editor{flex:1;min-height:0;width:100%;box-sizing:border-box;resize:none;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);padding:12px 14px;font-family:ui-monospace,Consolas,"Courier New",monospace;font-size:13px;line-height:1.65;}',
@@ -255,28 +273,82 @@ window.__ModuleLoader__.load({
 
     function Icon(props) {
       const size = typeof props.size === 'number' ? props.size : 16;
+      // Pending count, for the red dot. The sidebar gives this cell only
+      // `size`/`active`, so the count is fetched here and refreshed on a slow
+      // timer plus the event the panel fires after every decision.
+      const [pending, setPending] = useState(0);
+      const [dotOn, setDotOn] = useState(() => readUi().dot !== false);
+
+      useEffect(() => {
+        const sync = () => setDotOn(readUi().dot !== false);
+        window.addEventListener('umem-ui-changed', sync);
+        window.addEventListener('storage', sync);
+        return () => {
+          window.removeEventListener('umem-ui-changed', sync);
+          window.removeEventListener('storage', sync);
+        };
+      }, []);
+
+      useEffect(() => {
+        if (!dotOn) {
+          setPending(0);
+          return undefined;
+        }
+        let alive = true;
+        const tick = async () => {
+          try {
+            const data = await call('suggestions');
+            if (alive && data && data.ok === true) {
+              setPending(typeof data.pending === 'number' ? data.pending : 0);
+            }
+          } catch (error) {
+            /* the dot is a hint: a failed poll leaves it as it was */
+          }
+        };
+        void tick();
+        // 10s: slow enough to be free next to the panel's 5s poll, fast enough
+        // that a proposal shows up while the user is still in the conversation.
+        const timer = window.setInterval(tick, 10000);
+        const refresh = () => {
+          void tick();
+        };
+        window.addEventListener('umem-suggestions-changed', refresh);
+        return () => {
+          alive = false;
+          window.clearInterval(timer);
+          window.removeEventListener('umem-suggestions-changed', refresh);
+        };
+      }, [dotOn]);
+
       return h(
-        'svg',
-        {
-          width: size,
-          height: size,
-          viewBox: '0 0 24 24',
-          fill: 'none',
-          'aria-hidden': true,
-          style: { display: 'block' },
-        },
-        h('path', {
-          d: 'M4 5.5A2.5 2.5 0 0 1 6.5 3H19v15.5H6.5A2.5 2.5 0 0 0 4 21z',
-          stroke: 'currentColor',
-          strokeWidth: 1.6,
-          strokeLinejoin: 'round',
-        }),
-        h('path', {
-          d: 'M8 7.5h7M8 11h5',
-          stroke: 'currentColor',
-          strokeWidth: 1.6,
-          strokeLinecap: 'round',
-        }),
+        'span',
+        { className: 'umem-iconwrap', style: { display: 'inline-flex', position: 'relative' } },
+        h(
+          'svg',
+          {
+            width: size,
+            height: size,
+            viewBox: '0 0 24 24',
+            fill: 'none',
+            'aria-hidden': true,
+            style: { display: 'block' },
+          },
+          h('path', {
+            d: 'M4 5.5A2.5 2.5 0 0 1 6.5 3H19v15.5H6.5A2.5 2.5 0 0 0 4 21z',
+            stroke: 'currentColor',
+            strokeWidth: 1.6,
+            strokeLinejoin: 'round',
+          }),
+          h('path', {
+            d: 'M8 7.5h7M8 11h5',
+            stroke: 'currentColor',
+            strokeWidth: 1.6,
+            strokeLinecap: 'round',
+          }),
+        ),
+        dotOn && pending > 0
+          ? h('span', { className: 'umem-badge', title: pending + ' 条待确认建议' })
+          : null,
       );
     }
 
@@ -493,6 +565,13 @@ window.__ModuleLoader__.load({
           if (data && data.ok === true) {
             const items = data.items || [];
             setSuggestions(items);
+            // The sidebar icon keeps its own count; tell it a decision just
+            // changed so the dot disappears immediately instead of up to 10s later.
+            try {
+              window.dispatchEvent(new Event('umem-suggestions-changed'));
+            } catch (error) {
+              /* not a browser context: nothing to notify */
+            }
             // Seed each 补充框 from what the server recorded (written when the
             // user clicked 采纳). A box the user is already typing in keeps its
             // draft — the 5s poll must never wipe half-written text.
@@ -651,9 +730,13 @@ window.__ModuleLoader__.load({
                   ? '已采纳 #' + id + '。AI 下一轮会收到通知，然后把它总结进记忆。' +
                     (wrote ? '用户写的补充会一起交给 AI（和原文冲突时以补充为准）。' : '') +
                     '在 AI 下一轮开跑之前，这里随时可以撤销。'
-                  : decision === 'revoke'
-                    ? '已撤销 #' + id + '。它回到「待用户决定」：可以改补充，也可以重新采纳。'
-                    : '已忽略 #' + id + '，它不会被写入。',
+                  : decision === 'decline'
+                    ? '已标为不采纳 #' + id + '。AI 下一轮会收到「不要写这条」的通知。' +
+                      (wrote ? '补充会一起交给 AI —— 它说明为什么不采纳，或者正确做法是什么。' : '') +
+                      '在 AI 下一轮开跑之前，这里随时可以撤销。'
+                    : decision === 'revoke'
+                      ? '已撤销 #' + id + '。它回到「待用户决定」：可以改补充，也可以重新采纳或不采纳。'
+                      : '已忽略 #' + id + '：它不会被写入，也不会通知 AI。',
             });
           } catch (error) {
             setMessage({
@@ -891,6 +974,7 @@ window.__ModuleLoader__.load({
         delivered: '通知已送达 · 处理中',
         done: '已完成',
         dismissed: '已忽略',
+        declined: '已不采纳',
       };
 
       function waitingArea() {
@@ -944,7 +1028,7 @@ window.__ModuleLoader__.load({
                     spellCheck: false,
                     disabled: busyId !== '',
                     placeholder:
-                      '补充说明（可选）：用户想额外加的要求。点「采纳」时它和 AI 提议的原文一起交给 AI，冲突时以用户填写的补充为准。',
+                      '补充说明（可选）：点「采纳」或「不采纳」时，它都会和 AI 提议的原文一起交给下一轮的 AI（冲突时以补充为准）；点「忽略」则什么都不发。',
                     value: notes[item.id] || '',
                     onChange: function (event) {
                       const value = event.target.value;
@@ -972,6 +1056,19 @@ window.__ModuleLoader__.load({
                         },
                       },
                       busyId === item.id ? '处理中…' : '采纳',
+                    ),
+                    // 不采纳 ≠ 忽略：不采纳会把「不要写这条」连同补充交给下一轮的
+                    // AI，忽略则是静默丢弃。这就是第三个动作存在的理由。
+                    h(
+                      'button',
+                      {
+                        className: 'umem-btn',
+                        disabled: busyId !== '',
+                        onClick: function () {
+                          void resolve(item.id, 'decline', { note: notes[item.id] || '' });
+                        },
+                      },
+                      '不采纳',
                     ),
                     h(
                       'button',
@@ -1006,17 +1103,40 @@ window.__ModuleLoader__.load({
                         '已采纳，还没交给 AI 下一轮。撤销后它回到「待用户决定」，可以改完补充再采纳。',
                       ),
                     )
-                  : isDelivered
+                  : item.status === 'declined'
                     ? h(
                         'div',
                         { className: 'umem-cardfoot' },
                         h(
+                          'button',
+                          {
+                            className: 'umem-btn',
+                            disabled: busyId !== '',
+                            onClick: function () {
+                              void resolve(item.id, 'revoke');
+                            },
+                          },
+                          busyId === item.id ? '撤销中…' : '撤销不采纳',
+                        ),
+                        h(
                           'span',
                           { className: 'umem-msg' },
-                          '这条已经交给 AI 下一轮了，撤销来不及；要改就在对话里直接跟 AI 说。',
+                          item.declinedDeliveredAt !== undefined
+                            ? '已不采纳，理由/补充已经交给 AI 了（不会写入记忆）。'
+                            : '已不采纳：不会写入记忆，AI 下一轮开跑之前还可以撤销；补充会跟通知一起交给 AI。',
                         ),
                       )
-                    : null,
+                    : isDelivered
+                      ? h(
+                          'div',
+                          { className: 'umem-cardfoot' },
+                          h(
+                            'span',
+                            { className: 'umem-msg' },
+                            '这条已经交给 AI 下一轮了，撤销来不及；要改就在对话里直接跟 AI 说。',
+                          ),
+                        )
+                      : null,
             );
           }),
         );
@@ -1651,7 +1771,15 @@ window.__ModuleLoader__.load({
 
       function settingsArea() {
         const apply = function (hidden, preset) {
-          const next = { hidden: hidden.slice(), preset: preset };
+          const next = { hidden: hidden.slice(), preset: preset, dot: ui.dot !== false };
+          setUi(next);
+          writeUi(next);
+          setMessage(null);
+        };
+        // The red-dot switch is the one setting here that is not about tabs, so it
+        // writes the whole object instead of going through `apply`.
+        const setDot = function (on) {
+          const next = { hidden: ui.hidden.slice(), preset: ui.preset, dot: on === true };
           setUi(next);
           writeUi(next);
           setMessage(null);
@@ -1710,6 +1838,24 @@ window.__ModuleLoader__.load({
             'div',
             { className: 'umem-msg' },
             '隐藏只影响面板看不看得到，不影响注入：藏起来的记忆照样每轮都会进上下文。要让它真的不注入，只能改文件内容。',
+          ),
+          h('div', { className: 'umem-sectitle' }, '提示'),
+          h(
+            'label',
+            { className: 'umem-label' },
+            h('input', {
+              type: 'checkbox',
+              checked: ui.dot !== false,
+              onChange: function (event) {
+                setDot(event.target.checked);
+              },
+            }),
+            '待确认区有未处理的建议时，左侧「多功能记忆」图标显示红点',
+          ),
+          h(
+            'div',
+            { className: 'umem-msg' },
+            '红点只说明「待确认区里有东西在等你决定」：它不写记忆、不进上下文，也不通知 AI。关掉它只是不再提醒，建议本身还在待确认区。',
           ),
           h(
             'div',

@@ -776,6 +776,40 @@ function acceptedText(items) {
 }
 
 /**
+ * The notice for suggestions the user decided NOT to take — the third decision
+ * next to 采纳 and 忽略. A rejection can carry a supplement too: that is how the
+ * user says "not this way, but that way", and it has to reach the model, or the
+ * only trace of the decision is a status nobody reads.
+ *
+ * Deliberately separate from the acceptance: the model must not write these.
+ */
+function declinedText(items) {
+  const lines = [
+    '<MEMORY_SUGGESTION_DECLINED>',
+    '用户在右侧「多功能记忆 → 待确认」里没有采纳这些记忆建议：',
+  ]
+  for (const item of items) {
+    lines.push('', `#${item.id} → ${item.file}`)
+    for (const line of String(item.text).split(/\r?\n/)) lines.push(`  ${line}`)
+    if (typeof item.why === 'string' && item.why !== '') lines.push(`  理由：${item.why}`)
+    // A supplement on a rejection explains WHY, or names the right wording. It
+    // outranks the proposal; the model still does not get to edit memory for it.
+    if (typeof item.userNote === 'string' && item.userNote !== '') {
+      lines.push('  用户补充（说明为什么不要这条，或给出正确做法；与上面的原文冲突时以它为准）：')
+      for (const line of item.userNote.split(/\r?\n/)) lines.push(`    ${line}`)
+    }
+  }
+  lines.push(
+    '',
+    '不要把这些内容写进记忆文件，也不要把它们总结进记忆——用户没有采纳。',
+    '带「用户补充」的条目按补充处理：在对话里给一句回应即可，要不要改记忆等用户明说。',
+    '不要重提同一条建议。',
+    '</MEMORY_SUGGESTION_DECLINED>',
+  )
+  return lines.join('\n')
+}
+
+/**
  * Host plugin entry point.
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @param {{ enabled?: boolean, dir?: string, maxChars?: number, autoCapture?: boolean }} [config]
@@ -1365,13 +1399,24 @@ export async function apply(ctx, config = {}) {
       return Number.isNaN(stamp) ? true : now - stamp > ACCEPTED_ORPHAN_MS
     }
     const accepted = store.items.filter((item) => item.status === 'accepted' && claimable(item))
-    if (accepted.length === 0) return decision
+    // A rejection keeps its own status (the panel keeps saying 已不采纳), so its
+    // delivery is marked with `declinedDeliveredAt` instead of moving to
+    // `delivered` — the card would otherwise claim a rejection was accepted.
+    const declined = store.items.filter(
+      (item) => item.status === 'declined' && item.declinedDeliveredAt === undefined && claimable(item),
+    )
+    if (accepted.length === 0 && declined.length === 0) return decision
+    const stamp = new Date().toISOString()
     for (const item of accepted) {
       item.status = 'delivered'
-      item.deliveredAt = new Date().toISOString()
+      item.deliveredAt = stamp
     }
+    for (const item of declined) item.declinedDeliveredAt = stamp
     await saveStore()
-    return { kind: 'enter', messages: [...decision.messages, userMessage(acceptedText(accepted))] }
+    const extra = []
+    if (accepted.length > 0) extra.push(userMessage(acceptedText(accepted)))
+    if (declined.length > 0) extra.push(userMessage(declinedText(declined)))
+    return { kind: 'enter', messages: [...decision.messages, ...extra] }
   })
 
   // The section provider must be synchronous, so the files are read here and
@@ -1599,20 +1644,42 @@ export async function apply(ctx, config = {}) {
     if (action === 'resolveSuggestion') {
       const id = typeof payload?.id === 'string' ? payload.id : String(payload?.id ?? '')
       const choice = payload?.decision
-      if (choice !== 'accept' && choice !== 'dismiss' && choice !== 'revoke') {
-        return Response.json({ ok: false, error: '决定必须是 accept、dismiss 或 revoke' }, { status: 400 })
+      if (choice !== 'accept' && choice !== 'decline' && choice !== 'dismiss' && choice !== 'revoke') {
+        return Response.json({ ok: false, error: '决定必须是 accept、decline、dismiss 或 revoke' }, { status: 400 })
       }
       const item = store.items.find((entry) => entry.id === id)
       if (item === undefined) {
         return Response.json({ ok: false, error: '找不到这条建议' }, { status: 404 })
       }
 
-      // 撤销：只对「已采纳、但还没交到下一轮」那一小段窗口有效 —— 这正是误点
+      // 撤销：只对「已决定、但还没交到下一轮」那一小段窗口有效 —— 这正是误点
       // 与反悔的窗口。判定只依据当前 status，所以重复点击、以及和 pre-step
       // 送达撞车（先送达、后撤销）都不会把状态写坏：撞车时这里如实拒绝。
       if (choice === 'revoke') {
         if (item.status === 'pending') {
           return Response.json({ ok: false, error: '这条还在等用户决定，不需要撤销。' }, { status: 409 })
+        }
+        if (item.status === 'declined') {
+          if (item.declinedDeliveredAt !== undefined) {
+            return Response.json(
+              {
+                ok: false,
+                error: '这条的「不采纳」已经交到下一轮了，无法撤销；要改就在对话里直接跟 AI 说。',
+                status: 'declined',
+              },
+              { status: 409 },
+            )
+          }
+          item.status = 'pending'
+          delete item.decidedAt
+          // A supplement written for the rejection is dropped with it: the item is
+          // undecided again, and a stale note would ride along with whichever
+          // decision the user makes next.
+          delete item.userNote
+          delete item.userNoteAt
+          await saveStore()
+          ctx.logger?.info?.(`user-memory: 建议 #${id} 撤销不采纳 → pending`)
+          return Response.json({ ok: true, id, status: item.status, pending: pendingCount() })
         }
         if (item.status !== 'accepted') {
           const reason =
@@ -1629,15 +1696,15 @@ export async function apply(ctx, config = {}) {
         return Response.json({ ok: true, id, status: item.status, pending: pendingCount() })
       }
 
-      // The user's own supplement travels with the acceptance. It is stored here
-      // and only here — typing into the panel's box writes nothing, so an
-      // undecided suggestion leaves no trace on disk.
-      if (choice === 'accept' && typeof payload?.note === 'string') {
+      // The user's own supplement travels with either decision: on 采纳 it is an
+      // extra requirement, on 不采纳 it is "why not / do it this way instead".
+      // Typing into the box writes nothing; only the click stores it.
+      if ((choice === 'accept' || choice === 'decline') && typeof payload?.note === 'string') {
         item.userNote = payload.note.trim().slice(0, MAX_NOTE_CHARS)
         item.userNoteAt = new Date().toISOString()
       }
 
-      item.status = choice === 'accept' ? 'accepted' : 'dismissed'
+      item.status = choice === 'accept' ? 'accepted' : choice === 'decline' ? 'declined' : 'dismissed'
       item.decidedAt = new Date().toISOString()
       await saveStore()
       ctx.logger?.info?.(`user-memory: 建议 #${id} → ${item.status}`)

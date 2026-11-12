@@ -234,9 +234,18 @@ function route(payload) {
     if (payload.decision === 'accept') {
       item.status = 'accepted'
       item.userNote = typeof payload.note === 'string' ? payload.note.trim() : ''
+    } else if (payload.decision === 'decline') {
+      item.status = 'declined'
+      item.userNote = typeof payload.note === 'string' ? payload.note.trim() : ''
     } else if (payload.decision === 'revoke') {
-      item.status = 'pending'
-      delete item.decidedAt
+      if (item.status === 'declined') {
+        item.status = 'pending'
+        delete item.decidedAt
+        delete item.userNote
+      } else {
+        item.status = 'pending'
+        delete item.decidedAt
+      }
     } else {
       item.status = 'dismissed'
     }
@@ -377,9 +386,15 @@ const box = container.querySelector('.umem-note')
 check('panel: pending card shows a 补充 textarea', box !== null && box.tagName === 'TEXTAREA')
 check(
   'panel: the box explains itself and starts empty',
-  box.placeholder.includes('补充说明') && box.placeholder.includes('以用户填写的补充为准') && box.value === '',
+  box.placeholder.includes('补充说明') && box.placeholder.includes('以补充为准') && box.placeholder.includes('点「忽略」则什么都不发') && box.value === '',
 )
 check('panel: no read-only note line while nothing is written', container.querySelector('.umem-note-ro') === null)
+check(
+  'panel: a pending card offers 采纳 / 不采纳 / 忽略',
+  buttonByText('采纳') !== undefined &&
+    buttonByText('不采纳') !== undefined &&
+    buttonByText('忽略') !== undefined,
+)
 
 // ---------- 2. typing alone writes nothing ----------
 await type(box, '  就一句话，别用术语  ')
@@ -441,6 +456,42 @@ check(
   container.querySelector('.umem-note').value,
 )
 
+// ---------- 6.5 不采纳 keeps the supplement, 忽略 does not ----------
+// Three decisions, not two: 不采纳 tells the AI "not this" (and why), 忽略 says
+// nothing at all. The panel is the only place that distinction exists.
+items = [
+  {
+    id: '8',
+    file: 'agent.md',
+    text: '少用列表。',
+    why: '用户提过两次',
+    status: 'pending',
+  },
+]
+await poll()
+check(
+  'panel: a fresh pending card offers 不采纳 next to 采纳/忽略',
+  container.querySelector('.umem-note') !== null && buttonByText('不采纳') !== undefined,
+)
+await type(container.querySelector('.umem-note'), '不是少用列表，是每条都要能独立看懂')
+await click(buttonByText('不采纳'))
+check(
+  'panel: 不采纳 sends decision=decline with the typed supplement',
+  lastResolve !== null &&
+    lastResolve.decision === 'decline' &&
+    lastResolve.id === '8' &&
+    lastResolve.note === '不是少用列表，是每条都要能独立看懂',
+  JSON.stringify(lastResolve),
+)
+check('panel: the message says the rejection reaches the AI', text().includes('不要写这条'))
+await poll()
+check('panel: a declined card offers 撤销不采纳', buttonByText('撤销不采纳') !== undefined)
+check(
+  'panel: the declined card promises no memory write',
+  text().includes('不会写入记忆'),
+  (container.querySelector('.umem-cardfoot') || {}).textContent || 'MISSING',
+)
+
 // ---------- 7. once delivered, revoking is gone ----------
 items = [
   {
@@ -468,6 +519,7 @@ check(
   text().includes('当前状态来自插件配置'),
 )
 
+const decidesBeforeSwitch = sent.filter((p) => p.action === 'resolveSuggestion').length
 await click(switchButton())
 check(
   'panel: clicking it sends on=true',
@@ -482,7 +534,10 @@ check(
 
 // An agent proposing something is independent of the switch: turning it on must
 // not touch the waiting area.
-check('panel: flipping the switch sends no suggestion decision', sent.every((p) => p.action !== 'resolveSuggestion' || p.id === '7'))
+check(
+  'panel: flipping the switch sends no suggestion decision',
+  sent.filter((p) => p.action === 'resolveSuggestion').length === decidesBeforeSwitch,
+)
 
 await click(switchButton())
 check(
@@ -692,6 +747,59 @@ check(
 )
 await click(buttonByText('全部'))
 check('panel: 全部 brings the hidden tabs back', buttonByText('临时记忆') !== undefined)
+
+// ---------- 10.7 红点开关：提醒归提醒，记忆归记忆 ----------
+// The switch lives with the view settings, but it is not about tabs: it decides
+// whether the sidebar icon may say "有东西在等你". Off must still keep the queue.
+const dotLabel = () => [...container.querySelectorAll('.umem-label')].find((label) => label.textContent.includes('红点'))
+check('panel: 设置 offers a red-dot switch', dotLabel() !== undefined)
+const dotBox = () => dotLabel() && dotLabel().querySelector('input[type=checkbox]')
+check('panel: the red dot is on by default', dotBox() !== null && dotBox().checked === true)
+const decidesBeforeDot = sent.filter((p) => p.action === 'resolveSuggestion').length
+await flush(() => { dotBox().click() })
+check(
+  'panel: turning the red dot off is remembered in localStorage',
+  (w.localStorage.getItem('dsh-user-memory:ui') || '').includes('"dot":false'),
+  String(w.localStorage.getItem('dsh-user-memory:ui')),
+)
+check('panel: turning it off is not a suggestion decision', sent.filter((p) => p.action === 'resolveSuggestion').length === decidesBeforeDot)
+await flush(() => { dotBox().click() })
+check(
+  'panel: turning it back on is remembered too',
+  (w.localStorage.getItem('dsh-user-memory:ui') || '').includes('"dot":true'),
+  String(w.localStorage.getItem('dsh-user-memory:ui')),
+)
+
+// ---------- 10.8 the sidebar icon carries the dot ----------
+// The panel is usually closed; the icon is the only surface that can say "there
+// is something waiting". The slot carries no badge prop, so the icon draws it.
+items = [
+  { id: '9', file: 'log.md', text: '一条待确认', why: '', status: 'pending', createdAt: '2026-11-12T00:00:00.000Z' },
+]
+const iconHost = document.createElement('div')
+document.body.appendChild(iconHost)
+const iconRoot = createRoot(iconHost)
+await flush(() => { iconRoot.render(React.createElement(sidebarEntry.comp, { size: 16, active: false })) })
+await flush()
+await flush()
+await flush()
+check(
+  'client: the sidebar icon shows a dot while a suggestion waits',
+  iconHost.querySelector('.umem-badge') !== null,
+  iconHost.innerHTML.slice(0, 240),
+)
+await flush(() => {
+  w.localStorage.setItem('dsh-user-memory:ui', JSON.stringify({ hidden: [], preset: 'all', dot: false }))
+  w.dispatchEvent(new w.Event('umem-ui-changed'))
+})
+await flush()
+await flush()
+check(
+  'client: the off switch removes the dot but keeps the queue',
+  iconHost.querySelector('.umem-badge') === null && items.length === 1,
+)
+await flush(() => { iconRoot.unmount() })
+iconHost.remove()
 
 // ---------- 11. the composer chip falls back to a select ----------
 // The primitive menu is not resolvable in this test (and may be missing in an

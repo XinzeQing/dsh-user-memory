@@ -499,7 +499,79 @@ check(
   Array.isArray(lateTurn.messages) && lateTurn.messages.some((m) => m.content[0].text.includes('原会话再也没回来的建议')),
 )
 
-for (const entry of [first, second, third]) {
+// ---------- 18. 不采纳 is a decision, not silence ----------
+// 忽略 (dismiss) drops the item; 不采纳 still tells the model not to write it,
+// and carries the supplement — that is how the user says "not this, but that".
+const fourth = makeCtx()
+await apply(fourth.ctx, { dir: memDir })
+const dSuggest = fourth.box.tools.find((t) => t.name === 'memory_suggest')
+const dPost = async (payload) => (await fourth.box.route.fetch(request(payload))).json()
+const rejected = await dSuggest.execute(
+  { file: 'agent.md', text: '不要写的建议' },
+  { agent: { id: 'session-D' } },
+)
+const declined = await dPost({
+  action: 'resolveSuggestion',
+  id: rejected.id,
+  decision: 'decline',
+  note: '  不要这个说法，改成「先给结论」。  ',
+})
+check(
+  'decline: the route records the rejection and its supplement',
+  declined.ok === true && declined.status === 'declined' && declined.userNote === '不要这个说法，改成「先给结论」。',
+  JSON.stringify(declined),
+)
+const storedDecline = (await dPost({ action: 'suggestions' })).items.find((i) => i.id === rejected.id)
+check(
+  'decline: the item stays declined on disk, not delivered',
+  storedDecline.status === 'declined' && storedDecline.declinedDeliveredAt === undefined,
+  JSON.stringify(storedDecline),
+)
+const declineDecision = { kind: 'enter', messages: [] }
+const declineTurn = await fourth.box.preStep(
+  { agent: { id: 'session-D' }, messages: [{ source: { kind: 'user' } }] },
+  async () => declineDecision,
+)
+const declineNotice = Array.isArray(declineTurn.messages)
+  ? declineTurn.messages.find((m) => m.content[0].text.includes('<MEMORY_SUGGESTION_DECLINED>'))
+  : undefined
+check(
+  'decline: the origin session is told not to write it',
+  declineTurn !== declineDecision &&
+    declineNotice !== undefined &&
+    declineNotice.content[0].text.includes('先给结论') &&
+    declineNotice.content[0].text.includes('不要把这些内容写进记忆文件'),
+)
+check(
+  'decline: delivery is marked without changing the status',
+  (await dPost({ action: 'suggestions' })).items.find((i) => i.id === rejected.id).declinedDeliveredAt !== undefined,
+)
+const declineAgain = { kind: 'enter', messages: [] }
+const repeatTurn = await fourth.box.preStep(
+  { agent: { id: 'session-D' }, messages: [{ source: { kind: 'user' } }] },
+  async () => declineAgain,
+)
+check('decline: the notice is delivered exactly once', repeatTurn === declineAgain)
+const lateDeclineRevoke = await dPost({ action: 'resolveSuggestion', id: rejected.id, decision: 'revoke' })
+check(
+  'decline: revoke is refused (409) once the rejection is delivered',
+  lateDeclineRevoke.ok === false && lateDeclineRevoke.status === 'declined',
+)
+// A rejection that has NOT left yet can be taken back — same window as 采纳.
+const fresh = await dSuggest.execute({ file: 'profile.md', text: '还来得及撤回的不采纳' })
+await dPost({ action: 'resolveSuggestion', id: fresh.id, decision: 'decline', note: '先不要' })
+const undone = await dPost({ action: 'resolveSuggestion', id: fresh.id, decision: 'revoke' })
+check(
+  'decline: an undelivered rejection can be revoked back to pending',
+  undone.ok === true && undone.status === 'pending',
+  JSON.stringify(undone),
+)
+check(
+  'decline: revoking drops the stale supplement',
+  (await dPost({ action: 'suggestions' })).items.find((i) => i.id === fresh.id).userNote === undefined,
+)
+
+for (const entry of [first, second, third, fourth]) {
   for (const fn of entry.box.disposers) if (typeof fn === 'function') fn()
 }
 
